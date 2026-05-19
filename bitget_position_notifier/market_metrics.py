@@ -16,6 +16,13 @@ import requests
 LOGGER = logging.getLogger("market-metrics")
 
 
+def normalize_symbol(symbol: str) -> str:
+    normalized = symbol.strip().upper()
+    if normalized.endswith("USDT") and len(normalized) > 4:
+        return f"{normalized[:-4]}-USDT"
+    return normalized
+
+
 @dataclass(frozen=True)
 class ExchangeMetric:
     exchange: str
@@ -119,6 +126,7 @@ class MarketMetricStore:
             "quote_volume_30m": "TEXT",
             "raw_json": "TEXT",
             "source": "TEXT",
+            "source_symbol": "TEXT",
         }
         for column_name, column_type in optional_columns.items():
             if column_name not in existing_columns:
@@ -149,9 +157,9 @@ class MarketMetricStore:
                     taker_buy_volume, taker_sell_volume, taker_buy_sell_ratio,
                     top_account_long_ratio, top_account_short_ratio, top_account_long_short_ratio,
                     top_position_long_ratio, top_position_short_ratio, top_position_long_short_ratio,
-                    normalized_symbol, quote_volume_30m, raw_json, source
+                    normalized_symbol, quote_volume_30m, raw_json, source, source_symbol
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     metric.exchange,
@@ -172,9 +180,10 @@ class MarketMetricStore:
                     value(metric.top_position_long_ratio),
                     value(metric.top_position_short_ratio),
                     value(metric.top_position_long_short_ratio),
-                    symbol.upper(),
-                    value(metric.latest_volume),
+                    normalize_symbol(symbol),
                     None,
+                    None,
+                    "public_market_api",
                     metric.source_symbol,
                 ),
             )

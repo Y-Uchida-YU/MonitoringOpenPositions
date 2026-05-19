@@ -23,6 +23,7 @@ MARKET_SAMPLE_COLUMNS: dict[str, str] = {
     "quote_volume_30m": "TEXT",
     "raw_json": "TEXT",
     "source": "TEXT",
+    "source_symbol": "TEXT",
 }
 
 

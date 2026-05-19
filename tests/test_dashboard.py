@@ -14,7 +14,7 @@ from dashboard import (  # noqa: E402
     calculate_normalized_points,
     read_snapshot,
 )
-from market_metrics import MarketMetricStore  # noqa: E402
+from market_metrics import ExchangeMetric, MarketMetricStore, normalize_symbol  # noqa: E402
 
 
 def create_market_db(path: Path) -> None:
@@ -157,4 +157,44 @@ def test_sqlite_migration_backward_compatibility(tmp_path: Path) -> None:
     with sqlite3.connect(db_path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(market_samples)").fetchall()}
 
-    assert {"normalized_symbol", "quote_volume_30m", "raw_json", "source"}.issubset(columns)
+    assert {"normalized_symbol", "quote_volume_30m", "raw_json", "source", "source_symbol"}.issubset(columns)
+
+
+def test_normalize_symbol() -> None:
+    assert normalize_symbol("BTCUSDT") == "BTC-USDT"
+    assert normalize_symbol("ETHUSDT") == "ETH-USDT"
+    assert normalize_symbol("SOLUSDT") == "SOL-USDT"
+
+
+def test_normalize_symbol_unknown_does_not_crash() -> None:
+    assert normalize_symbol("UNKNOWN") == "UNKNOWN"
+    assert normalize_symbol("") == ""
+
+
+def test_market_sample_quote_volume_can_be_none_and_source_is_public_api(tmp_path: Path) -> None:
+    db_path = tmp_path / "market.sqlite3"
+    store = MarketMetricStore(db_path)
+    metric = ExchangeMetric(
+        exchange="Binance",
+        source_symbol="BTCUSDT",
+        oi_value=None,
+        latest_volume=None,
+    )
+
+    store.save_market_sample("BTCUSDT", 1000, metric)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT normalized_symbol, quote_volume_30m, source, source_symbol
+            FROM market_samples
+            WHERE exchange = ? AND symbol = ?
+            """,
+            ("Binance", "BTCUSDT"),
+        ).fetchone()
+
+    assert row["normalized_symbol"] == "BTC-USDT"
+    assert row["quote_volume_30m"] is None
+    assert row["source"] == "public_market_api"
+    assert row["source_symbol"] == "BTCUSDT"
