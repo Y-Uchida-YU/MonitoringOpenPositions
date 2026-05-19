@@ -92,7 +92,7 @@ Behavior:
 
 ## Dashboard
 
-The dashboard reads saved OI samples from SQLite and runs locally without extra Python dependencies.
+The dashboard reads saved market samples from SQLite and runs locally. It is independent from the Discord notification loop: `main.py` collects data and sends notifications, while `dashboard.py` only reads the SQLite database and renders a browser UI.
 
 ```powershell
 python dashboard.py
@@ -107,13 +107,46 @@ http://127.0.0.1:8765
 It shows:
 
 - Symbol selector
-- Normalized OI trend by exchange
-- Raw OI trend by exchange
-- 30m volume trend by exchange
-- Latest exchange table
-- Long/Short, volume spike, Binance taker buy/sell, and Binance top trader columns
-- Last-sample OI change heatmap
-- Auto refresh every 20 seconds so new bot samples appear shortly after notification
+- Exchange OI Trend with raw / normalized toggle
+- Exchange Volume Trend for `volume_30m`
+- Aggregated OI Trend, bucketed by 10 minutes
+- Aggregated Volume Trend, bucketed by 10 minutes
+- Long/Short Trader Ratio Trend
+- Long/Short Volume Trend using taker buy/sell volume where available
+- Latest Market Table with OI, volume, long/short, taker, and smart trader columns
+- Market structure summary cards
+- Auto refresh every 60 seconds
+
+SQLite database location:
+
+```text
+bitget_position_notifier/data/market_metrics.sqlite3
+```
+
+Dashboard indicators:
+
+- `OI`: Open interest reported by each exchange's public market API. Units and definitions can differ by venue.
+- `Normalized OI`: Each exchange's first visible OI sample is set to `100`, making relative changes easier to compare.
+- `Aggregated OI`: Sum of monitored exchange OI inside a 10-minute bucket. Missing exchange values are not filled.
+- `volume_30m`: Latest saved 30-minute volume sample.
+- `Aggregated Volume`: Sum of monitored exchange `volume_30m` inside a 10-minute bucket.
+- `long_ratio` / `short_ratio`: Account long/short ratios when the exchange exposes them.
+- `long_short_ratio`: Long ratio divided by short ratio, or the exchange-provided equivalent.
+- `Taker Buy Volume` / `Taker Sell Volume`: Binance public taker buy/sell volume when available.
+- `Buy/Sell Ratio`: Taker buy volume divided by taker sell volume.
+- `Top Trader Account Long/Short Ratio`: Binance top trader account ratio.
+- `Top Trader Position Long/Short Ratio`: Binance top trader position ratio.
+
+Binance Smart Money / Smart Trader Metrics are displayed without mixing definitions:
+
+- `Global Long/Short Account Ratio`
+- `Top Trader Account Long/Short Ratio`
+- `Top Trader Position Long/Short Ratio`
+- `Taker Buy/Sell Volume`
+
+Long/Short Volume note:
+
+`Taker Buy/Sell Volume` is not strictly the same as long/short position volume. It is used as a public proxy where available. Exchanges expose different definitions and some venues do not provide comparable long/short or taker volume fields; unavailable values are shown as `N/A`.
 
 ## Discord Notification Content
 

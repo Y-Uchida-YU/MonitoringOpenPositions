@@ -106,6 +106,23 @@ class MarketMetricStore:
                 ON market_samples(exchange, symbol, observed_at)
                 """
             )
+            self._migrate_market_samples(conn)
+
+    @staticmethod
+    def _migrate_market_samples(conn: sqlite3.Connection) -> None:
+        existing_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(market_samples)").fetchall()
+        }
+        optional_columns = {
+            "normalized_symbol": "TEXT",
+            "quote_volume_30m": "TEXT",
+            "raw_json": "TEXT",
+            "source": "TEXT",
+        }
+        for column_name, column_type in optional_columns.items():
+            if column_name not in existing_columns:
+                conn.execute(f"ALTER TABLE market_samples ADD COLUMN {column_name} {column_type}")
 
     def save_oi(self, exchange: str, symbol: str, observed_at: int, oi_value: Decimal) -> None:
         with self._connect() as conn:
@@ -131,9 +148,10 @@ class MarketMetricStore:
                     long_ratio, short_ratio, long_short_ratio,
                     taker_buy_volume, taker_sell_volume, taker_buy_sell_ratio,
                     top_account_long_ratio, top_account_short_ratio, top_account_long_short_ratio,
-                    top_position_long_ratio, top_position_short_ratio, top_position_long_short_ratio
+                    top_position_long_ratio, top_position_short_ratio, top_position_long_short_ratio,
+                    normalized_symbol, quote_volume_30m, raw_json, source
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     metric.exchange,
@@ -154,6 +172,10 @@ class MarketMetricStore:
                     value(metric.top_position_long_ratio),
                     value(metric.top_position_short_ratio),
                     value(metric.top_position_long_short_ratio),
+                    symbol.upper(),
+                    value(metric.latest_volume),
+                    None,
+                    metric.source_symbol,
                 ),
             )
             cutoff = observed_at - 7 * 24 * 60 * 60
