@@ -17,7 +17,7 @@ class Config:
     margin_coin: str = "USDT"
     bitget_locale: str = "en-US"
     request_timeout_seconds: float = 10.0
-    poll_interval_seconds: int = 600
+    poll_interval_seconds: int = 900
     discord_username: str = "Bitget Position Bot"
     enable_market_metrics: bool = True
     market_data_exchanges: tuple[str, ...] = ("binance", "bybit", "bitget", "okx", "gate", "hyperliquid")
@@ -38,7 +38,7 @@ def load_config() -> Config:
     if timeout <= 0:
         raise ValueError("REQUEST_TIMEOUT_SECONDS must be > 0")
 
-    interval = int(os.getenv("POLL_INTERVAL_SECONDS", "600"))
+    interval = int(os.getenv("POLL_INTERVAL_SECONDS", "900"))
     if interval <= 0:
         raise ValueError("POLL_INTERVAL_SECONDS must be > 0")
 

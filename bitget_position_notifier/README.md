@@ -1,6 +1,6 @@
 # Bitget Position Notifier (Read-only)
 
-This bot fetches your Bitget futures open positions every 10 minutes and sends a readable Discord Embed notification.
+This bot fetches your Bitget futures open positions every 15 minutes and sends a readable Discord Embed notification.
 It does not place orders or execute trades.
 
 ## Features
@@ -9,7 +9,7 @@ It does not place orders or execute trades.
   - `GET /api/v2/mix/position/all-position`
 - Read-only environment variable based authentication
 - `.env` support
-- Runs once immediately at startup, then every 10 minutes
+- Runs on JST wall-clock quarter hours: `00`, `15`, `30`, and `45`
 - Discord Embed notifications with one field per symbol
 - Sends error summary to Discord if API call fails
 - Keeps running even if API or Discord fails temporarily
@@ -71,7 +71,7 @@ BITGET_PRODUCT_TYPE=USDT-FUTURES
 BITGET_MARGIN_COIN=USDT
 BITGET_LOCALE=en-US
 REQUEST_TIMEOUT_SECONDS=10
-POLL_INTERVAL_SECONDS=600
+POLL_INTERVAL_SECONDS=900
 DISCORD_USERNAME=Bitget Position Bot
 
 ENABLE_MARKET_METRICS=true
@@ -87,8 +87,8 @@ python main.py
 
 Behavior:
 
-- Sends one notification immediately after startup
-- Then repeats every `POLL_INTERVAL_SECONDS` (default: 600s = 10 minutes)
+- Waits until the next JST quarter-hour slot
+- Then repeats on `00`, `15`, `30`, and `45` minutes every hour
 
 ## Dashboard
 
@@ -113,6 +113,7 @@ It shows:
 - Latest exchange table
 - Long/Short, volume spike, Binance taker buy/sell, and Binance top trader columns
 - Last-sample OI change heatmap
+- Auto refresh every 20 seconds so new bot samples appear shortly after notification
 
 ## Discord Notification Content
 

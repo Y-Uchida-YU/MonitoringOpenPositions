@@ -427,6 +427,7 @@ HTML = r"""<!doctype html>
     let normalizedChart;
     let rawChart;
     let volumeChart;
+    let dashboardLoading = false;
     const colors = ["#0d6a7d", "#b14b2c", "#11835b", "#7a5c19", "#5c6470", "#8f3f65", "#2f6f3e"];
 
     function formatNumber(value) {
@@ -523,38 +524,46 @@ HTML = r"""<!doctype html>
     }
 
     async function loadDashboard(symbol) {
+      if (dashboardLoading) return;
+      dashboardLoading = true;
       const qs = symbol ? `?symbol=${encodeURIComponent(symbol)}` : "";
-      const response = await fetch(`/api/snapshot${qs}`);
-      const data = await response.json();
-      const select = document.getElementById("symbolSelect");
-      select.innerHTML = data.symbols.map(item => `<option value="${item}">${item}</option>`).join("");
-      if (data.selectedSymbol) select.value = data.selectedSymbol;
+      try {
+        const separator = qs ? "&" : "?";
+        const response = await fetch(`/api/snapshot${qs}${separator}ts=${Date.now()}`, { cache: "no-store" });
+        const data = await response.json();
+        const select = document.getElementById("symbolSelect");
+        select.innerHTML = data.symbols.map(item => `<option value="${item}">${item}</option>`).join("");
+        if (data.selectedSymbol) select.value = data.selectedSymbol;
 
-      if (data.error) {
-        document.getElementById("subtitle").textContent = data.error;
-        return;
+        if (data.error) {
+          document.getElementById("subtitle").textContent = data.error;
+          return;
+        }
+
+        document.getElementById("subtitle").textContent = `Generated ${data.generatedAt} JST from ${data.dbPath}`;
+        document.getElementById("metricSymbol").textContent = data.selectedSymbol;
+        document.getElementById("metricAverage").textContent = formatPct(data.marketAverageChangePct);
+        document.getElementById("metricAverage").className = clsFor(data.marketAverageChangePct);
+        document.getElementById("metricLongBias").textContent = formatRatioPct(data.averageLongRatio);
+        document.getElementById("metricLongBias").className = data.averageLongRatio >= 0.5 ? "good" : "bad";
+        document.getElementById("metricVolumeSpike").textContent = data.averageVolumeSpike === null || data.averageVolumeSpike === undefined ? "-" : `${data.averageVolumeSpike.toFixed(2)}x`;
+        document.getElementById("metricLatest").textContent = data.latestSampleAt || "-";
+        document.getElementById("tableNote").textContent = `${data.summary.length} exchanges`;
+
+        normalizedChart = renderChart("normalizedChart", normalizedChart, data.series, "normalized", "Normalized OI");
+        rawChart = renderChart("rawChart", rawChart, data.series, "raw", "Raw OI");
+        volumeChart = renderChart("volumeChart", volumeChart, data.series, "volume", "30m Volume");
+        renderTable(data.summary);
+        renderHeat(data.summary);
+      } finally {
+        dashboardLoading = false;
       }
-
-      document.getElementById("subtitle").textContent = `Generated ${data.generatedAt} JST from ${data.dbPath}`;
-      document.getElementById("metricSymbol").textContent = data.selectedSymbol;
-      document.getElementById("metricAverage").textContent = formatPct(data.marketAverageChangePct);
-      document.getElementById("metricAverage").className = clsFor(data.marketAverageChangePct);
-      document.getElementById("metricLongBias").textContent = formatRatioPct(data.averageLongRatio);
-      document.getElementById("metricLongBias").className = data.averageLongRatio >= 0.5 ? "good" : "bad";
-      document.getElementById("metricVolumeSpike").textContent = data.averageVolumeSpike === null || data.averageVolumeSpike === undefined ? "-" : `${data.averageVolumeSpike.toFixed(2)}x`;
-      document.getElementById("metricLatest").textContent = data.latestSampleAt || "-";
-      document.getElementById("tableNote").textContent = `${data.summary.length} exchanges`;
-
-      normalizedChart = renderChart("normalizedChart", normalizedChart, data.series, "normalized", "Normalized OI");
-      rawChart = renderChart("rawChart", rawChart, data.series, "raw", "Raw OI");
-      volumeChart = renderChart("volumeChart", volumeChart, data.series, "volume", "30m Volume");
-      renderTable(data.summary);
-      renderHeat(data.summary);
     }
 
     document.getElementById("symbolSelect").addEventListener("change", event => loadDashboard(event.target.value));
     document.getElementById("refreshButton").addEventListener("click", () => loadDashboard(document.getElementById("symbolSelect").value));
     loadDashboard();
+    setInterval(() => loadDashboard(document.getElementById("symbolSelect").value), 20000);
   </script>
 </body>
 </html>

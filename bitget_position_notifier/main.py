@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
@@ -278,6 +278,29 @@ def send_embeds_in_batches(notifier: DiscordNotifier, embeds: list[dict[str, Any
         notifier.send_embeds(embeds[i : i + MAX_EMBEDS_PER_MESSAGE])
 
 
+def next_aligned_run_at(interval_seconds: int, *, now: datetime | None = None) -> datetime:
+    if interval_seconds <= 0 or 86400 % interval_seconds != 0:
+        raise ValueError("POLL_INTERVAL_SECONDS must divide 86400 for wall-clock aligned scheduling")
+
+    current = now or datetime.now(JST)
+    midnight = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed_seconds = int((current - midnight).total_seconds())
+    next_slot_seconds = ((elapsed_seconds // interval_seconds) + 1) * interval_seconds
+
+    if next_slot_seconds >= 86400:
+        return midnight + timedelta(days=1)
+
+    return midnight + timedelta(seconds=next_slot_seconds)
+
+
+def sleep_until_next_aligned_run(interval_seconds: int, logger: logging.Logger) -> datetime:
+    target = next_aligned_run_at(interval_seconds)
+    sleep_seconds = max(0.0, (target - datetime.now(JST)).total_seconds())
+    logger.info("Waiting %.2f seconds until aligned JST run at %s", sleep_seconds, target.strftime("%H:%M:%S"))
+    time.sleep(sleep_seconds)
+    return target
+
+
 def run() -> None:
     config = load_config()
     app_dir = Path(__file__).resolve().parent
@@ -310,14 +333,16 @@ def run() -> None:
         )
 
     logger.info(
-        "Position monitor started (product_type=%s, margin_coin=%s, interval=%s sec)",
+        "Position monitor started (product_type=%s, margin_coin=%s, aligned_interval=%s sec)",
         config.product_type,
         config.margin_coin,
         config.poll_interval_seconds,
     )
 
     while True:
+        scheduled_at = sleep_until_next_aligned_run(config.poll_interval_seconds, logger)
         cycle_start = time.monotonic()
+        logger.info("Starting aligned monitor cycle scheduled for %s JST", scheduled_at.strftime("%Y-%m-%d %H:%M:%S"))
 
         try:
             positions = client.get_all_positions(
@@ -356,9 +381,7 @@ def run() -> None:
                 logger.exception("Failed to send unexpected error to Discord")
 
         elapsed = time.monotonic() - cycle_start
-        sleep_seconds = max(0.0, config.poll_interval_seconds - elapsed)
-        logger.info("Sleeping %.2f seconds until next cycle", sleep_seconds)
-        time.sleep(sleep_seconds)
+        logger.info("Monitor cycle finished in %.2f seconds", elapsed)
 
 
 if __name__ == "__main__":
