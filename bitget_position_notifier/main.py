@@ -12,6 +12,7 @@ from bitget_client import BitgetApiError, BitgetClient
 from config import load_config
 from discord_notifier import DiscordNotifier, DiscordNotifierError
 from market_metrics import MarketMetricService, SymbolMarketMetrics
+from smart_signal import SmartSignalClient, SmartSignalStore
 
 JST = ZoneInfo("Asia/Tokyo")
 MAX_FIELDS_PER_EMBED = 25
@@ -325,12 +326,17 @@ def run() -> None:
         username=config.discord_username,
     )
     market_metric_service = None
+    smart_signal_client = None
+    smart_signal_store = None
     if config.enable_market_metrics:
         market_metric_service = MarketMetricService(
             exchange_names=list(config.market_data_exchanges),
             timeout_seconds=config.request_timeout_seconds,
             db_path=app_dir / config.market_metrics_db_path,
         )
+    if config.enable_binance_smart_signal:
+        smart_signal_client = SmartSignalClient(timeout_seconds=config.request_timeout_seconds)
+        smart_signal_store = SmartSignalStore(app_dir / config.market_metrics_db_path)
 
     logger.info(
         "Position monitor started (product_type=%s, margin_coin=%s, aligned_interval=%s sec)",
@@ -355,6 +361,9 @@ def run() -> None:
                 if market_metric_service is not None and symbols
                 else {}
             )
+            if smart_signal_client is not None and smart_signal_store is not None:
+                smart_signal_symbols = sorted(set(symbols) | set(config.binance_smart_signal_symbols))
+                smart_signal_store.save_samples(smart_signal_client.fetch_current_positions(smart_signal_symbols))
             embeds = build_position_embeds(
                 positions,
                 product_type=config.product_type,

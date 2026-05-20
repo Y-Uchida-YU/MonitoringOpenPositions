@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import time
 from collections import defaultdict
@@ -11,6 +12,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+from dotenv import load_dotenv
+from market_metrics import normalize_symbol
+from smart_signal import SmartSignalStore
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -73,6 +78,14 @@ def row_value(row: sqlite3.Row | dict[str, Any], key: str) -> Any:
     return row.get(key)
 
 
+def bool_env(name: str, default: bool = False) -> bool:
+    load_dotenv()
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def point(timestamp: int, value: Decimal | None) -> dict[str, Any]:
     return {"x": jst_iso(timestamp), "y": decimal_to_float(value)}
 
@@ -124,6 +137,106 @@ def build_aggregated_series(
             continue
         buckets[bucket_timestamp(int(row["observed_at"]), bucket_seconds)] += value
     return [point(timestamp, value) for timestamp, value in sorted(buckets.items())]
+
+
+def build_smart_signal_series(rows: list[sqlite3.Row], value_key: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in rows:
+        value = to_decimal(row_value(row, value_key))
+        if value is None:
+            continue
+        grouped[row["symbol"]].append(row)
+
+    series = []
+    for symbol, items in sorted(grouped.items()):
+        data = [
+            point(int(item["observed_at"]), to_decimal(row_value(item, value_key)))
+            for item in sorted(items, key=lambda row: int(row["observed_at"]))
+        ]
+        if data:
+            series.append({"exchange": symbol, "data": data})
+    return series
+
+
+def read_smart_signal_snapshot(
+    db_path: Path,
+    *,
+    selected_symbol: str | None,
+    enabled: bool,
+    limit: int = 240,
+) -> dict[str, Any]:
+    SmartSignalStore(db_path)
+    empty = {
+        "enabled": enabled,
+        "available": False,
+        "samples": [],
+        "charts": {
+            "avgEntryPrice": [],
+            "unrealizedPnl": [],
+            "unrealizedPnlPct": [],
+        },
+    }
+    if not enabled:
+        return empty
+
+    normalized_symbol = normalize_symbol(selected_symbol) if selected_symbol else None
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        if normalized_symbol:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT *
+                    FROM smart_signal_samples
+                    WHERE normalized_symbol = ?
+                    ORDER BY observed_at ASC
+                    LIMIT ?
+                    """,
+                    (normalized_symbol, limit),
+                )
+            )
+        else:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT *
+                    FROM smart_signal_samples
+                    ORDER BY observed_at ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+            )
+
+    if not rows:
+        return empty
+
+    samples = [
+        {
+            "observedAt": jst_iso(int(row["observed_at"])),
+            "source": row["source"],
+            "symbol": row["symbol"],
+            "normalizedSymbol": row["normalized_symbol"],
+            "side": row["side"],
+            "avgEntryPrice": decimal_to_float(to_decimal(row["avg_entry_price"])),
+            "currentPrice": decimal_to_float(to_decimal(row["current_price"])),
+            "unrealizedPnl": decimal_to_float(to_decimal(row["unrealized_pnl"])),
+            "unrealizedPnlPct": decimal_to_float(to_decimal(row["unrealized_pnl_pct"])),
+            "positionSize": decimal_to_float(to_decimal(row["position_size"])),
+            "profitableRatio": decimal_to_float(to_decimal(row["profitable_ratio"])),
+        }
+        for row in rows
+    ]
+    return {
+        "enabled": enabled,
+        "available": True,
+        "samples": samples,
+        "charts": {
+            "avgEntryPrice": build_smart_signal_series(rows, "avg_entry_price"),
+            "unrealizedPnl": build_smart_signal_series(rows, "unrealized_pnl"),
+            "unrealizedPnlPct": build_smart_signal_series(rows, "unrealized_pnl_pct"),
+        },
+    }
 
 
 def aggregate_latest_total(summary: list[dict[str, Any]], key: str) -> Decimal | None:
@@ -271,6 +384,11 @@ def read_snapshot(db_path: Path, *, symbol: str | None = None, limit: int = 240)
                 "takerBuySellRatio": taker_buy_sell_ratio,
             },
         },
+        "smartSignal": read_smart_signal_snapshot(
+            db_path,
+            selected_symbol=selected_symbol,
+            enabled=bool_env("ENABLE_BINANCE_SMART_SIGNAL", False),
+        ),
         "notes": [
             "Long/Short Volume is represented by taker buy/sell volume when available.",
             "Definitions differ by exchange; unavailable metrics are shown as N/A.",
@@ -480,6 +598,29 @@ HTML = r"""<!doctype html>
     </section>
 
     <section class="section">
+      <div class="section-head"><h2>Binance Smart Money / Smart Signal</h2><span>Current Position extension point</span></div>
+      <div id="smartSignalUnavailable" class="notice">Smart Signal data is not available or disabled.</div>
+      <div id="smartSignalCharts" class="grid-2" style="display: none;">
+        <div class="panel">
+          <div class="panel-title"><h3>Avg Entry Price Trend</h3><span>Smart Signal sample</span></div>
+          <div class="chart-wrap"><canvas id="smartEntryChart"></canvas></div>
+        </div>
+        <div class="panel">
+          <div class="panel-title"><h3>Unrealized PnL Trend</h3><span>Current position PnL</span></div>
+          <div class="chart-wrap"><canvas id="smartPnlChart"></canvas></div>
+        </div>
+        <div class="panel">
+          <div class="panel-title"><h3>Unrealized PnL % / ROI Trend</h3><span>ROI when available</span></div>
+          <div class="chart-wrap"><canvas id="smartRoiChart"></canvas></div>
+        </div>
+      </div>
+      <div class="notice">
+        Smart Signal metrics depend on Binance's public availability. If no stable public API is available,
+        this dashboard does not scrape protected or login-gated data.
+      </div>
+    </section>
+
+    <section class="section">
       <div class="section-head"><h2>Latest Market Table</h2><span id="tableNote">Latest sample by exchange</span></div>
       <div class="panel table-wrap" id="tableMount"></div>
     </section>
@@ -557,6 +698,20 @@ HTML = r"""<!doctype html>
       const ratio = datasets(data.takerBuySellRatio, " B/S").map(item => ({ ...item, yAxisID: "y" }));
       renderChart("takerVolumeChart", [...buy, ...sell, ...ratio], "Volume / Ratio");
     }
+    function renderSmartSignal(data) {
+      const unavailable = document.getElementById("smartSignalUnavailable");
+      const chartsMount = document.getElementById("smartSignalCharts");
+      if (!data || !data.enabled || !data.available || !data.samples.length) {
+        unavailable.style.display = "block";
+        chartsMount.style.display = "none";
+        return;
+      }
+      unavailable.style.display = "none";
+      chartsMount.style.display = "grid";
+      renderChart("smartEntryChart", datasets(data.charts.avgEntryPrice), "Avg Entry Price");
+      renderChart("smartPnlChart", datasets(data.charts.unrealizedPnl), "Unrealized PnL");
+      renderChart("smartRoiChart", datasets(data.charts.unrealizedPnlPct), "Unrealized PnL % / ROI");
+    }
     function renderTable(rows) {
       if (!rows || !rows.length) {
         document.getElementById("tableMount").innerHTML = `<div class="error">No market samples yet.</div>`;
@@ -614,6 +769,7 @@ HTML = r"""<!doctype html>
       renderChart("aggregatedVolumeChart", singleDataset("Aggregated Volume", dashboardData.charts.aggregatedVolume, "#7a5c19"), "Sum 30m Volume");
       renderLongShortChart(dashboardData.charts.longShortTraderRatio);
       renderTakerChart(dashboardData.charts.longShortVolume);
+      renderSmartSignal(dashboardData.smartSignal);
       renderTable(dashboardData.latestMarketTable);
     }
     async function loadDashboard(symbol) {

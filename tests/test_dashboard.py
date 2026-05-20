@@ -15,6 +15,7 @@ from dashboard import (  # noqa: E402
     read_snapshot,
 )
 from market_metrics import ExchangeMetric, MarketMetricStore, normalize_symbol  # noqa: E402
+from smart_signal import SmartSignalStore, sample_from_payload  # noqa: E402
 
 
 def create_market_db(path: Path) -> None:
@@ -198,3 +199,91 @@ def test_market_sample_quote_volume_can_be_none_and_source_is_public_api(tmp_pat
     assert row["quote_volume_30m"] is None
     assert row["source"] == "public_market_api"
     assert row["source_symbol"] == "BTCUSDT"
+
+
+def test_smart_signal_samples_migration(tmp_path: Path) -> None:
+    db_path = tmp_path / "market.sqlite3"
+
+    SmartSignalStore(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(smart_signal_samples)").fetchall()}
+
+    assert {
+        "id",
+        "observed_at",
+        "source",
+        "symbol",
+        "normalized_symbol",
+        "side",
+        "avg_entry_price",
+        "current_price",
+        "unrealized_pnl",
+        "unrealized_pnl_pct",
+        "position_size",
+        "profitable_ratio",
+        "raw_json",
+    }.issubset(columns)
+
+
+def test_smart_signal_disabled_does_not_crash(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "market.sqlite3"
+    create_market_db(db_path)
+    monkeypatch.setenv("ENABLE_BINANCE_SMART_SIGNAL", "false")
+
+    payload = read_snapshot(db_path, symbol="BTCUSDT")
+
+    assert payload["smartSignal"]["enabled"] is False
+    assert payload["smartSignal"]["samples"] == []
+
+
+def test_smart_signal_no_data_returns_empty_arrays(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "market.sqlite3"
+    create_market_db(db_path)
+    monkeypatch.setenv("ENABLE_BINANCE_SMART_SIGNAL", "true")
+
+    payload = read_snapshot(db_path, symbol="BTCUSDT")
+
+    assert payload["smartSignal"]["enabled"] is True
+    assert payload["smartSignal"]["available"] is False
+    assert payload["smartSignal"]["charts"]["avgEntryPrice"] == []
+
+
+def test_smart_signal_series_with_sample_data(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "market.sqlite3"
+    create_market_db(db_path)
+    store = SmartSignalStore(db_path)
+    store.save_samples(
+        [
+            sample_from_payload(
+                {
+                    "observed_at": 1000,
+                    "symbol": "BTCUSDT",
+                    "side": "long",
+                    "avg_entry_price": "100",
+                    "current_price": "110",
+                    "unrealized_pnl": "10",
+                    "unrealized_pnl_pct": "0.1",
+                }
+            ),
+            sample_from_payload(
+                {
+                    "observed_at": 1600,
+                    "symbol": "BTCUSDT",
+                    "side": "long",
+                    "avg_entry_price": "105",
+                    "current_price": "120",
+                    "unrealized_pnl": "15",
+                    "roi": "0.1428",
+                }
+            ),
+        ]
+    )
+    monkeypatch.setenv("ENABLE_BINANCE_SMART_SIGNAL", "true")
+
+    payload = read_snapshot(db_path, symbol="BTCUSDT")
+
+    assert payload["smartSignal"]["available"] is True
+    assert payload["smartSignal"]["charts"]["avgEntryPrice"][0]["data"][-1]["y"] == 105.0
+    assert payload["smartSignal"]["charts"]["unrealizedPnl"][0]["data"][-1]["y"] == 15.0
+    assert payload["smartSignal"]["charts"]["unrealizedPnlPct"][0]["data"][-1]["y"] == 0.1428

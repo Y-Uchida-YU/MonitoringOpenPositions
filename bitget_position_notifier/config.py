@@ -22,6 +22,8 @@ class Config:
     enable_market_metrics: bool = True
     market_data_exchanges: tuple[str, ...] = ("binance", "bybit", "bitget", "okx", "gate", "hyperliquid")
     market_metrics_db_path: str = "data/market_metrics.sqlite3"
+    enable_binance_smart_signal: bool = False
+    binance_smart_signal_symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 
 def _require_env(name: str) -> str:
@@ -50,6 +52,11 @@ def load_config() -> Config:
         ).split(",")
         if exchange.strip()
     )
+    smart_signal_symbols = tuple(
+        symbol.strip().upper()
+        for symbol in os.getenv("BINANCE_SMART_SIGNAL_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",")
+        if symbol.strip()
+    )
 
     return Config(
         bitget_api_key=_require_env("BITGET_API_KEY"),
@@ -66,4 +73,7 @@ def load_config() -> Config:
         enable_market_metrics=os.getenv("ENABLE_MARKET_METRICS", "true").strip().lower() in {"1", "true", "yes", "on"},
         market_data_exchanges=exchanges,
         market_metrics_db_path=os.getenv("MARKET_METRICS_DB_PATH", "data/market_metrics.sqlite3").strip(),
+        enable_binance_smart_signal=os.getenv("ENABLE_BINANCE_SMART_SIGNAL", "false").strip().lower()
+        in {"1", "true", "yes", "on"},
+        binance_smart_signal_symbols=smart_signal_symbols,
     )

@@ -77,6 +77,9 @@ DISCORD_USERNAME=Bitget Position Bot
 ENABLE_MARKET_METRICS=true
 MARKET_DATA_EXCHANGES=binance,bybit,bitget,okx,gate,hyperliquid
 MARKET_METRICS_DB_PATH=data/market_metrics.sqlite3
+
+ENABLE_BINANCE_SMART_SIGNAL=false
+BINANCE_SMART_SIGNAL_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT
 ```
 
 ## Run
@@ -113,6 +116,7 @@ It shows:
 - Aggregated Volume Trend, bucketed by 10 minutes
 - Long/Short Trader Ratio Trend
 - Long/Short Volume Trend using taker buy/sell volume where available
+- Binance Smart Money / Smart Signal section
 - Latest Market Table with OI, volume, long/short, taker, and smart trader columns
 - Market structure summary cards
 - Auto refresh every 60 seconds
@@ -147,6 +151,14 @@ Binance Smart Money / Smart Trader Metrics are displayed without mixing definiti
 Long/Short Volume note:
 
 `Taker Buy/Sell Volume` is not strictly the same as long/short position volume. It is used as a public proxy where available. Exchanges expose different definitions and some venues do not provide comparable long/short or taker volume fields; unavailable values are shown as `N/A`.
+
+Binance Smart Money / Smart Signal:
+
+- Disabled by default with `ENABLE_BINANCE_SMART_SIGNAL=false`.
+- `SmartSignalClient.fetch_current_positions()` is currently a safe stub that returns no samples because no stable official public endpoint for the requested Binance Smart Signal current-position data has been wired in.
+- The dashboard includes the database and UI extension point for Avg Entry Price, Unrealized PnL, and Unrealized PnL % / ROI.
+- The implementation does not scrape protected, login-gated, captcha-gated, or bot-protected page data.
+- If no stable public API is available, the dashboard shows `Smart Signal data is not available or disabled.`
 
 ## Discord Notification Content
 
