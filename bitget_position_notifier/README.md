@@ -26,6 +26,7 @@ bitget_position_notifier/
   discord_notifier.py
   config.py
   market_metrics.py
+  smart_signal.py
   requirements.txt
   .env.example
   README.md
@@ -77,6 +78,9 @@ DISCORD_USERNAME=Bitget Position Bot
 ENABLE_MARKET_METRICS=true
 MARKET_DATA_EXCHANGES=binance,bybit,bitget,okx,gate,hyperliquid
 MARKET_METRICS_DB_PATH=data/market_metrics.sqlite3
+
+ENABLE_BINANCE_SMART_SIGNAL=false
+BINANCE_SMART_SIGNAL_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT
 ```
 
 ## Run
@@ -96,7 +100,7 @@ GitHub Actions runs pytest automatically on pushes to `main` and pull requests t
 
 The CI job:
 
-- Uses `ubuntu-latest`
+- Uses `ubuntu-latest` and `windows-latest`
 - Uses Python `3.11`
 - Installs dependencies with `pip install -r requirements.txt`
 - Runs `pytest ../tests` from `bitget_position_notifier`
@@ -106,7 +110,7 @@ The tests do not call live Bitget APIs or Discord webhooks.
 
 ## Dashboard
 
-The dashboard reads saved OI samples from SQLite and runs locally without extra Python dependencies.
+The dashboard reads saved market samples from SQLite and runs locally without extra Python dependencies.
 
 ```powershell
 python dashboard.py
@@ -120,14 +124,53 @@ http://127.0.0.1:8765
 
 It shows:
 
-- Symbol selector
-- Normalized OI trend by exchange
-- Raw OI trend by exchange
-- 30m volume trend by exchange
-- Latest exchange table
-- Long/Short, volume spike, Binance taker buy/sell, and Binance top trader columns
-- Last-sample OI change heatmap
-- Auto refresh every 20 seconds so new bot samples appear shortly after notification
+- Header with selected symbol, latest JST sample time, refresh button, and 60 second auto refresh
+- Market summary cards for Total OI USDT, OI change %, Total 30m Volume USDT, volume change %, average long ratio, and average taker buy/sell ratio
+- Exchange OI Trend with Raw OI USDT / Normalized OI toggle
+- Exchange Volume Trend using 30m Volume USDT when conversion is available
+- Aggregated Market Trend with 10 minute buckets across monitored exchanges
+- Long/Short Structure for account ratios where public data is available
+- Long/Short Volume Trend using Taker Buy/Sell Volume as the practical public-data fallback
+- Binance Smart Money / Smart Signal section when enabled and data exists
+- Latest Exchange Table with USDT values first and raw values as supporting context
+- OI change heatmap for quick visual strength/weakness checks
+
+### Dashboard v2 and USDT Normalization
+
+Dashboard v2 uses USDT as the primary display and aggregation unit wherever possible.
+
+Market metrics can arrive in different units depending on the exchange:
+
+- Base quantity: converted with `raw_quantity * price_usdt`
+- Quote or USDT value: kept as-is
+- Unknown unit or unavailable price: USDT value is stored as `NULL` and shown as `N/A`
+
+The SQLite `market_samples` table keeps both raw and converted values:
+
+- Raw examples: `oi_raw`, `volume_30m_raw`, `taker_buy_volume_raw`
+- Unit examples: `oi_raw_unit`, `volume_30m_raw_unit`
+- USDT examples: `oi_usdt`, `volume_30m_usdt`, `taker_buy_volume_usdt`
+- Price provenance: `price_usdt`, `conversion_source`
+
+Existing compatibility columns such as `oi_value`, `volume_30m`, `taker_buy_volume`, and `taker_sell_volume` remain in place. New dashboard calculations prefer `*_usdt` columns and fall back to legacy columns only when USDT values are unavailable.
+
+The database is stored at:
+
+```text
+bitget_position_notifier/data/market_metrics.sqlite3
+```
+
+Older SQLite databases are migrated on startup without deleting existing rows.
+
+### Indicator Notes
+
+OI, volume, and taker metrics are not defined identically by every exchange. Cross-exchange totals are most useful after USDT conversion, but the original raw values are retained so you can inspect the source unit.
+
+Long/Short Volume is also not standardized. Where direct long/short volume is unavailable, the dashboard displays Taker Buy/Sell Volume and labels it as such.
+
+Binance Smart Money / Smart Signal is disabled by default. This project does not scrape protected, login-gated, bot-protected, or CAPTCHA-protected Binance pages. If no stable public API is available, the dashboard shows `Smart Signal data is not available or disabled.`
+
+The dashboard is independent of the Bitget position notification loop. `python main.py` can run the notifier, and `python dashboard.py` can be started separately for local analysis.
 
 ## Discord Notification Content
 
