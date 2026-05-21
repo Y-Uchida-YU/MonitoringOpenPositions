@@ -90,6 +90,20 @@ Behavior:
 - Waits until the next JST quarter-hour slot
 - Then repeats on `00`, `15`, `30`, and `45` minutes every hour
 
+## CI
+
+GitHub Actions runs pytest automatically on pushes to `main` and pull requests targeting `main`.
+
+The CI job:
+
+- Uses `ubuntu-latest`
+- Uses Python `3.11`
+- Installs dependencies with `pip install -r requirements.txt`
+- Runs `pytest ../tests` from `bitget_position_notifier`
+- Uses dummy environment variables for Bitget and Discord settings
+
+The tests do not call live Bitget APIs or Discord webhooks.
+
 ## Dashboard
 
 The dashboard reads saved OI samples from SQLite and runs locally without extra Python dependencies.

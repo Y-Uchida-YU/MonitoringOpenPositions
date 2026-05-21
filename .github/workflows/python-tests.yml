@@ -1,0 +1,45 @@
+name: Python tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  pytest:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    defaults:
+      run:
+        working-directory: bitget_position_notifier
+
+    env:
+      BITGET_API_KEY: dummy
+      BITGET_API_SECRET: dummy
+      BITGET_PASSPHRASE: dummy
+      DISCORD_WEBHOOK_URL: https://example.com/webhook
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run pytest
+        run: python -m pytest ../tests
