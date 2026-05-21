@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+import json
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from statistics import mean
@@ -14,6 +15,22 @@ import requests
 
 
 LOGGER = logging.getLogger("market-metrics")
+USDT_UNITS = {"quote", "usdt", "usd", "usdc"}
+BASE_UNITS = {"base", "coin", "asset"}
+
+
+def normalize_symbol(symbol: str) -> str:
+    value = (symbol or "").strip().upper().replace("_", "-")
+    if not value:
+        return value
+    if "-" in value:
+        parts = value.split("-")
+        if len(parts) >= 2:
+            return f"{parts[0]}-{parts[1]}"
+    for quote in ("USDT", "USDC", "USD"):
+        if value.endswith(quote) and len(value) > len(quote):
+            return f"{value[:-len(quote)]}-{quote}"
+    return value
 
 
 @dataclass(frozen=True)
@@ -38,6 +55,20 @@ class ExchangeMetric:
     top_position_long_ratio: Decimal | None = None
     top_position_short_ratio: Decimal | None = None
     top_position_long_short_ratio: Decimal | None = None
+    price_usdt: Decimal | None = None
+    oi_raw: Decimal | None = None
+    oi_raw_unit: str | None = None
+    oi_usdt: Decimal | None = None
+    volume_30m_raw: Decimal | None = None
+    volume_30m_raw_unit: str | None = None
+    volume_30m_usdt: Decimal | None = None
+    taker_buy_volume_raw: Decimal | None = None
+    taker_buy_volume_raw_unit: str | None = None
+    taker_buy_volume_usdt: Decimal | None = None
+    taker_sell_volume_raw: Decimal | None = None
+    taker_sell_volume_raw_unit: str | None = None
+    taker_sell_volume_usdt: Decimal | None = None
+    conversion_source: str | None = None
     error: str | None = None
 
 
@@ -106,6 +137,53 @@ class MarketMetricStore:
                 ON market_samples(exchange, symbol, observed_at)
                 """
             )
+            self._ensure_market_sample_columns(conn)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_market_samples_normalized_lookup
+                ON market_samples(normalized_symbol, observed_at)
+                """
+            )
+
+    def _ensure_market_sample_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(market_samples)")}
+        required = {
+            "volume_spike": "TEXT",
+            "long_ratio": "TEXT",
+            "short_ratio": "TEXT",
+            "long_short_ratio": "TEXT",
+            "taker_buy_volume": "TEXT",
+            "taker_sell_volume": "TEXT",
+            "taker_buy_sell_ratio": "TEXT",
+            "top_account_long_ratio": "TEXT",
+            "top_account_short_ratio": "TEXT",
+            "top_account_long_short_ratio": "TEXT",
+            "top_position_long_ratio": "TEXT",
+            "top_position_short_ratio": "TEXT",
+            "top_position_long_short_ratio": "TEXT",
+            "normalized_symbol": "TEXT",
+            "quote_volume_30m": "TEXT",
+            "raw_json": "TEXT",
+            "source": "TEXT",
+            "source_symbol": "TEXT",
+            "oi_raw": "TEXT",
+            "oi_raw_unit": "TEXT",
+            "oi_usdt": "TEXT",
+            "volume_30m_raw": "TEXT",
+            "volume_30m_raw_unit": "TEXT",
+            "volume_30m_usdt": "TEXT",
+            "taker_buy_volume_raw": "TEXT",
+            "taker_buy_volume_raw_unit": "TEXT",
+            "taker_buy_volume_usdt": "TEXT",
+            "taker_sell_volume_raw": "TEXT",
+            "taker_sell_volume_raw_unit": "TEXT",
+            "taker_sell_volume_usdt": "TEXT",
+            "price_usdt": "TEXT",
+            "conversion_source": "TEXT",
+        }
+        for column, column_type in required.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE market_samples ADD COLUMN {column} {column_type}")
 
     def save_oi(self, exchange: str, symbol: str, observed_at: int, oi_value: Decimal) -> None:
         with self._connect() as conn:
@@ -123,6 +201,16 @@ class MarketMetricStore:
         def value(item: Decimal | None) -> str | None:
             return str(item) if item is not None else None
 
+        raw_payload = {
+            key: str(item) if isinstance(item, Decimal) else item
+            for key, item in asdict(metric).items()
+        }
+        quote_volume_30m = (
+            metric.volume_30m_usdt
+            if metric.volume_30m_raw_unit in USDT_UNITS and metric.volume_30m_usdt is not None
+            else None
+        )
+
         with self._connect() as conn:
             conn.execute(
                 """
@@ -131,9 +219,15 @@ class MarketMetricStore:
                     long_ratio, short_ratio, long_short_ratio,
                     taker_buy_volume, taker_sell_volume, taker_buy_sell_ratio,
                     top_account_long_ratio, top_account_short_ratio, top_account_long_short_ratio,
-                    top_position_long_ratio, top_position_short_ratio, top_position_long_short_ratio
+                    top_position_long_ratio, top_position_short_ratio, top_position_long_short_ratio,
+                    normalized_symbol, quote_volume_30m, raw_json, source, source_symbol,
+                    oi_raw, oi_raw_unit, oi_usdt,
+                    volume_30m_raw, volume_30m_raw_unit, volume_30m_usdt,
+                    taker_buy_volume_raw, taker_buy_volume_raw_unit, taker_buy_volume_usdt,
+                    taker_sell_volume_raw, taker_sell_volume_raw_unit, taker_sell_volume_usdt,
+                    price_usdt, conversion_source
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     metric.exchange,
@@ -154,6 +248,25 @@ class MarketMetricStore:
                     value(metric.top_position_long_ratio),
                     value(metric.top_position_short_ratio),
                     value(metric.top_position_long_short_ratio),
+                    normalize_symbol(symbol),
+                    value(quote_volume_30m),
+                    json.dumps(raw_payload, ensure_ascii=False, sort_keys=True),
+                    "public_market_api",
+                    metric.source_symbol,
+                    value(metric.oi_raw),
+                    metric.oi_raw_unit,
+                    value(metric.oi_usdt),
+                    value(metric.volume_30m_raw),
+                    metric.volume_30m_raw_unit,
+                    value(metric.volume_30m_usdt),
+                    value(metric.taker_buy_volume_raw),
+                    metric.taker_buy_volume_raw_unit,
+                    value(metric.taker_buy_volume_usdt),
+                    value(metric.taker_sell_volume_raw),
+                    metric.taker_sell_volume_raw_unit,
+                    value(metric.taker_sell_volume_usdt),
+                    value(metric.price_usdt),
+                    metric.conversion_source,
                 ),
             )
             cutoff = observed_at - 7 * 24 * 60 * 60
@@ -189,6 +302,26 @@ def to_decimal(value: Any) -> Decimal:
         return Decimal("0")
 
 
+def optional_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def convert_to_usdt(raw_value: Decimal | None, raw_unit: str | None, price_usdt: Decimal | None) -> Decimal | None:
+    if raw_value is None:
+        return None
+    unit = (raw_unit or "").lower()
+    if unit in USDT_UNITS:
+        return raw_value
+    if unit in BASE_UNITS and price_usdt is not None and price_usdt > 0:
+        return raw_value * price_usdt
+    return None
+
+
 def pct_change(current: Decimal | None, previous: Decimal | None) -> Decimal | None:
     if current is None or previous is None or previous == 0:
         return None
@@ -207,6 +340,9 @@ def volume_spike(latest: Decimal | None, historical: list[Decimal]) -> Decimal |
 
 class PublicExchangeClient:
     name = "base"
+    oi_raw_unit = "base"
+    volume_raw_unit = "quote"
+    taker_volume_raw_unit = "base"
 
     def __init__(self, timeout_seconds: float) -> None:
         self.timeout_seconds = timeout_seconds
@@ -217,6 +353,9 @@ class PublicExchangeClient:
 
     def fetch_oi(self, symbol: str) -> Decimal | None:
         raise NotImplementedError
+
+    def fetch_price_usdt(self, symbol: str) -> tuple[Decimal | None, str]:
+        return None, "unavailable"
 
     def fetch_recent_30m_volumes(self, symbol: str, limit: int = 49) -> list[Decimal]:
         raise NotImplementedError
@@ -262,6 +401,9 @@ class PublicExchangeClient:
 
 class BinanceClient(PublicExchangeClient):
     name = "Binance"
+    oi_raw_unit = "base"
+    volume_raw_unit = "quote"
+    taker_volume_raw_unit = "base"
 
     def resolve_symbol(self, symbol: str) -> str | None:
         if symbol not in self._symbol_cache:
@@ -282,6 +424,26 @@ class BinanceClient(PublicExchangeClient):
             params={"symbol": symbol},
         )
         return to_decimal(payload.get("openInterest"))
+
+    def fetch_price_usdt(self, symbol: str) -> tuple[Decimal | None, str]:
+        payload = self.get_json(
+            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            params={"symbol": symbol},
+        )
+        mark_price = optional_decimal(payload.get("markPrice"))
+        if mark_price is not None and mark_price > 0:
+            return mark_price, "binance_mark_price"
+        index_price = optional_decimal(payload.get("indexPrice"))
+        if index_price is not None and index_price > 0:
+            return index_price, "binance_index_price"
+        ticker = self.get_json(
+            "https://fapi.binance.com/fapi/v1/ticker/price",
+            params={"symbol": symbol},
+        )
+        last_price = optional_decimal(ticker.get("price"))
+        if last_price is not None and last_price > 0:
+            return last_price, "binance_ticker_last_price"
+        return None, "unavailable"
 
     def fetch_recent_30m_volumes(self, symbol: str, limit: int = 49) -> list[Decimal]:
         payload = self.get_json(
@@ -347,6 +509,8 @@ class BinanceClient(PublicExchangeClient):
 
 class BybitClient(PublicExchangeClient):
     name = "Bybit"
+    oi_raw_unit = "base"
+    volume_raw_unit = "quote"
 
     def resolve_symbol(self, symbol: str) -> str | None:
         if symbol not in self._symbol_cache:
@@ -368,6 +532,23 @@ class BybitClient(PublicExchangeClient):
         if not rows:
             return None
         return to_decimal(rows[0].get("openInterest"))
+
+    def fetch_price_usdt(self, symbol: str) -> tuple[Decimal | None, str]:
+        payload = self.get_json(
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "linear", "symbol": symbol},
+        )
+        rows = payload.get("result", {}).get("list", [])
+        item = rows[0] if rows else {}
+        for key, source in (
+            ("markPrice", "bybit_mark_price"),
+            ("lastPrice", "bybit_ticker_last_price"),
+            ("indexPrice", "bybit_index_price"),
+        ):
+            price = optional_decimal(item.get(key))
+            if price is not None and price > 0:
+                return price, source
+        return None, "unavailable"
 
     def fetch_recent_30m_volumes(self, symbol: str, limit: int = 49) -> list[Decimal]:
         payload = self.get_json(
@@ -392,6 +573,8 @@ class BybitClient(PublicExchangeClient):
 
 class BitgetPublicClient(PublicExchangeClient):
     name = "Bitget"
+    oi_raw_unit = "base"
+    volume_raw_unit = "quote"
 
     def resolve_symbol(self, symbol: str) -> str | None:
         if symbol not in self._symbol_cache:
@@ -420,6 +603,27 @@ class BitgetPublicClient(PublicExchangeClient):
             return to_decimal(open_interest_list[0].get("size"))
         return to_decimal(data.get("openInterest") or data.get("amount") or data.get("size"))
 
+    def fetch_price_usdt(self, symbol: str) -> tuple[Decimal | None, str]:
+        payload = self.get_json(
+            "https://api.bitget.com/api/v2/mix/market/ticker",
+            params={"symbol": symbol, "productType": "USDT-FUTURES"},
+        )
+        if payload.get("code") != "00000":
+            raise MarketDataError(f"Bitget returned code {payload.get('code')}: {payload.get('msg')}")
+        data = payload.get("data", {})
+        item = data[0] if isinstance(data, list) and data else data
+        if not isinstance(item, dict):
+            return None, "unavailable"
+        for key, source in (
+            ("markPrice", "bitget_mark_price"),
+            ("lastPr", "bitget_ticker_last_price"),
+            ("indexPrice", "bitget_index_price"),
+        ):
+            price = optional_decimal(item.get(key))
+            if price is not None and price > 0:
+                return price, source
+        return None, "unavailable"
+
     def fetch_recent_30m_volumes(self, symbol: str, limit: int = 49) -> list[Decimal]:
         payload = self.get_json(
             "https://api.bitget.com/api/v2/mix/market/candles",
@@ -447,6 +651,8 @@ class BitgetPublicClient(PublicExchangeClient):
 
 class OkxClient(PublicExchangeClient):
     name = "OKX"
+    oi_raw_unit = "quote"
+    volume_raw_unit = "quote"
 
     @staticmethod
     def inst_id(symbol: str) -> str:
@@ -475,6 +681,18 @@ class OkxClient(PublicExchangeClient):
             return None
         return to_decimal(rows[0].get("oiUsd") or rows[0].get("oiCcy") or rows[0].get("oi"))
 
+    def fetch_price_usdt(self, symbol: str) -> tuple[Decimal | None, str]:
+        payload = self.get_json(
+            "https://www.okx.com/api/v5/market/ticker",
+            params={"instId": symbol},
+        )
+        rows = payload.get("data", [])
+        item = rows[0] if rows else {}
+        price = optional_decimal(item.get("last"))
+        if price is not None and price > 0:
+            return price, "okx_ticker_last_price"
+        return None, "unavailable"
+
     def fetch_recent_30m_volumes(self, symbol: str, limit: int = 49) -> list[Decimal]:
         payload = self.get_json(
             "https://www.okx.com/api/v5/market/candles",
@@ -501,6 +719,8 @@ class OkxClient(PublicExchangeClient):
 
 class GateClient(PublicExchangeClient):
     name = "Gate"
+    oi_raw_unit = "quote"
+    volume_raw_unit = "quote"
 
     @staticmethod
     def contract(symbol: str) -> str:
@@ -528,6 +748,22 @@ class GateClient(PublicExchangeClient):
             return total_size * multiplier * mark_price
         return to_decimal(item.get("total_size"))
 
+    def fetch_price_usdt(self, symbol: str) -> tuple[Decimal | None, str]:
+        payload = self.get_json(
+            "https://api.gateio.ws/api/v4/futures/usdt/tickers",
+            params={"contract": symbol},
+        )
+        item = payload[0] if isinstance(payload, list) and payload else {}
+        for key, source in (
+            ("mark_price", "gate_mark_price"),
+            ("last", "gate_ticker_last_price"),
+            ("index_price", "gate_index_price"),
+        ):
+            price = optional_decimal(item.get(key))
+            if price is not None and price > 0:
+                return price, source
+        return None, "unavailable"
+
     def fetch_recent_30m_volumes(self, symbol: str, limit: int = 49) -> list[Decimal]:
         payload = self.get_json(
             "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
@@ -538,6 +774,8 @@ class GateClient(PublicExchangeClient):
 
 class HyperliquidClient(PublicExchangeClient):
     name = "Hyperliquid"
+    oi_raw_unit = "base"
+    volume_raw_unit = "quote"
 
     def _post_info(self, body: dict[str, Any]) -> Any:
         return self.get_json("https://api.hyperliquid.xyz/info", method="POST", json_body=body)
@@ -560,10 +798,26 @@ class HyperliquidClient(PublicExchangeClient):
         for index, asset in enumerate(universe):
             if asset.get("name") == symbol and index < len(contexts):
                 ctx = contexts[index]
-                oi = to_decimal(ctx.get("openInterest"))
-                mark = to_decimal(ctx.get("markPx") or ctx.get("midPx"))
-                return oi * mark if mark > 0 else oi
+                return to_decimal(ctx.get("openInterest"))
         return None
+
+    def fetch_price_usdt(self, symbol: str) -> tuple[Decimal | None, str]:
+        payload = self._post_info({"type": "metaAndAssetCtxs"})
+        if not isinstance(payload, list) or len(payload) < 2:
+            return None, "unavailable"
+        universe = payload[0].get("universe", [])
+        contexts = payload[1]
+        for index, asset in enumerate(universe):
+            if asset.get("name") == symbol and index < len(contexts):
+                ctx = contexts[index]
+                for key, source in (
+                    ("markPx", "hyperliquid_mark_price"),
+                    ("midPx", "hyperliquid_mid_price"),
+                ):
+                    price = optional_decimal(ctx.get(key))
+                    if price is not None and price > 0:
+                        return price, source
+        return None, "unavailable"
 
     def fetch_recent_30m_volumes(self, symbol: str, limit: int = 49) -> list[Decimal]:
         end_ms = int(time.time() * 1000)
@@ -618,16 +872,25 @@ class MarketMetricService:
         if source_symbol is None:
             return ExchangeMetric(exchange=client.name, source_symbol=None, is_listed=False)
 
-        oi_value = client.fetch_oi(source_symbol)
+        price_usdt, conversion_source = client.fetch_price_usdt(source_symbol)
+        oi_raw = client.fetch_oi(source_symbol)
+        oi_usdt = convert_to_usdt(oi_raw, client.oi_raw_unit, price_usdt)
+        oi_value = oi_usdt if oi_usdt is not None else oi_raw
         previous = self.store.previous_oi(client.name, symbol, observed_at)
         oi_change = pct_change(oi_value, previous)
 
         volumes = client.fetch_recent_30m_volumes(source_symbol)
         # Most exchanges include the still-forming candle first. Use the latest closed 30m candle.
-        latest_volume = volumes[1] if len(volumes) > 1 else (volumes[0] if volumes else None)
+        latest_volume_raw = volumes[1] if len(volumes) > 1 else (volumes[0] if volumes else None)
+        latest_volume_usdt = convert_to_usdt(latest_volume_raw, client.volume_raw_unit, price_usdt)
+        latest_volume = latest_volume_usdt if latest_volume_usdt is not None else latest_volume_raw
         historical = volumes[2:] if len(volumes) > 2 else []
         long_ratio, short_ratio, long_short_ratio = client.fetch_long_short_ratio(source_symbol)
-        taker_buy_volume, taker_sell_volume, taker_buy_sell_ratio = client.fetch_taker_buy_sell_volume(source_symbol)
+        taker_buy_volume_raw, taker_sell_volume_raw, taker_buy_sell_ratio = client.fetch_taker_buy_sell_volume(source_symbol)
+        taker_buy_volume_usdt = convert_to_usdt(taker_buy_volume_raw, client.taker_volume_raw_unit, price_usdt)
+        taker_sell_volume_usdt = convert_to_usdt(taker_sell_volume_raw, client.taker_volume_raw_unit, price_usdt)
+        taker_buy_volume = taker_buy_volume_usdt if taker_buy_volume_usdt is not None else taker_buy_volume_raw
+        taker_sell_volume = taker_sell_volume_usdt if taker_sell_volume_usdt is not None else taker_sell_volume_raw
         (
             top_account_long_ratio,
             top_account_short_ratio,
@@ -644,7 +907,7 @@ class MarketMetricService:
             oi_value=oi_value,
             oi_change_pct=oi_change,
             latest_volume=latest_volume,
-            volume_spike=volume_spike(latest_volume, historical),
+            volume_spike=volume_spike(latest_volume_raw, historical),
             long_ratio=long_ratio,
             short_ratio=short_ratio,
             long_short_ratio=long_short_ratio,
@@ -657,6 +920,20 @@ class MarketMetricService:
             top_position_long_ratio=top_position_long_ratio,
             top_position_short_ratio=top_position_short_ratio,
             top_position_long_short_ratio=top_position_long_short_ratio,
+            price_usdt=price_usdt,
+            oi_raw=oi_raw,
+            oi_raw_unit=client.oi_raw_unit,
+            oi_usdt=oi_usdt,
+            volume_30m_raw=latest_volume_raw,
+            volume_30m_raw_unit=client.volume_raw_unit,
+            volume_30m_usdt=latest_volume_usdt,
+            taker_buy_volume_raw=taker_buy_volume_raw,
+            taker_buy_volume_raw_unit=client.taker_volume_raw_unit,
+            taker_buy_volume_usdt=taker_buy_volume_usdt,
+            taker_sell_volume_raw=taker_sell_volume_raw,
+            taker_sell_volume_raw_unit=client.taker_volume_raw_unit,
+            taker_sell_volume_usdt=taker_sell_volume_usdt,
+            conversion_source=conversion_source,
         )
 
     def fetch_for_symbols(self, symbols: list[str]) -> dict[str, SymbolMarketMetrics]:

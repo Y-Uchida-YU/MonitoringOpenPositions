@@ -1,152 +1,269 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import time
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    load_dotenv = None
+
+from market_metrics import normalize_symbol
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = APP_DIR / "data" / "market_metrics.sqlite3"
 JST_OFFSET_SECONDS = 9 * 60 * 60
+BUCKET_SECONDS = 10 * 60
 
 
-def to_decimal(value: object) -> Decimal:
+def to_decimal(value: object) -> Decimal | None:
+    if value in (None, ""):
+        return None
     try:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
-        return Decimal("0")
+        return None
 
 
-def pct_change(current: Decimal, previous: Decimal | None) -> float | None:
-    if previous is None or previous == 0:
+def as_float(value: Decimal | None) -> float | None:
+    return float(value) if value is not None else None
+
+
+def pct_change(current: Decimal | None, previous: Decimal | None) -> float | None:
+    if current is None or previous in (None, Decimal("0")):
         return None
     return float(((current - previous) / previous) * Decimal("100"))
 
 
-def fmt_decimal(value: Decimal) -> float:
-    return float(value)
-
-
 def jst_iso(timestamp: int) -> str:
-    return datetime.utcfromtimestamp(timestamp + JST_OFFSET_SECONDS).strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(timestamp + JST_OFFSET_SECONDS, timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
-def read_snapshot(db_path: Path, *, symbol: str | None = None, limit: int = 180) -> dict[str, object]:
+def compact_decimal(value: Decimal | None) -> str:
+    if value is None:
+        return "N/A"
+    abs_value = abs(value)
+    for suffix, divisor in (("B", Decimal("1000000000")), ("M", Decimal("1000000")), ("K", Decimal("1000"))):
+        if abs_value >= divisor:
+            return f"{value / divisor:.2f}{suffix} USDT"
+    return f"{value:.2f} USDT"
+
+
+def table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+
+
+def has_table(conn: sqlite3.Connection, table_name: str) -> bool:
+    return conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)).fetchone() is not None
+
+
+def row_value(row: sqlite3.Row, columns: set[str], name: str) -> object | None:
+    return row[name] if name in columns else None
+
+
+def preferred_decimal(row: sqlite3.Row, columns: set[str], primary: str, fallback: str) -> Decimal | None:
+    primary_value = to_decimal(row_value(row, columns, primary))
+    return primary_value if primary_value is not None else to_decimal(row_value(row, columns, fallback))
+
+
+def bucket_at(timestamp: int) -> int:
+    return (timestamp // BUCKET_SECONDS) * BUCKET_SECONDS
+
+
+def point(timestamp: int, value: Decimal | None) -> dict[str, object]:
+    return {"x": jst_iso(timestamp), "y": as_float(value)}
+
+
+def normalize_points(rows: list[sqlite3.Row], columns: set[str]) -> list[dict[str, object]]:
+    first = next((preferred_decimal(row, columns, "oi_usdt", "oi_value") for row in rows if preferred_decimal(row, columns, "oi_usdt", "oi_value") not in (None, Decimal("0"))), None)
+    output: list[dict[str, object]] = []
+    for row in rows:
+        value = preferred_decimal(row, columns, "oi_usdt", "oi_value")
+        normalized = (value / first * Decimal("100")) if value is not None and first not in (None, Decimal("0")) else None
+        output.append(point(int(row["observed_at"]), normalized))
+    return output
+
+
+def latest_smart_signal(conn: sqlite3.Connection, selected_symbol: str, limit: int) -> dict[str, object]:
+    if not has_table(conn, "smart_signal_samples"):
+        return empty_smart_signal(False)
+    normalized = normalize_symbol(selected_symbol)
+    rows = list(
+        conn.execute(
+            """
+            SELECT * FROM smart_signal_samples
+            WHERE normalized_symbol = ?
+            ORDER BY observed_at DESC
+            LIMIT ?
+            """,
+            (normalized, limit),
+        )
+    )
+    ordered = list(reversed(rows))
+    return {
+        "enabled": os.getenv("ENABLE_BINANCE_SMART_SIGNAL", "false").strip().lower() in {"1", "true", "yes", "on"},
+        "note": "Smart Signal metrics depend on Binance's public availability. If no stable public API is available, this dashboard does not scrape protected or login-gated data.",
+        "samples": [dict(row) for row in ordered],
+        "avgEntryPrice": [point(int(row["observed_at"]), to_decimal(row["avg_entry_price"])) for row in ordered],
+        "unrealizedPnl": [point(int(row["observed_at"]), to_decimal(row["unrealized_pnl"])) for row in ordered],
+        "unrealizedPnlPct": [point(int(row["observed_at"]), to_decimal(row["unrealized_pnl_pct"])) for row in ordered],
+    }
+
+
+def empty_smart_signal(enabled: bool) -> dict[str, object]:
+    return {
+        "enabled": enabled,
+        "note": "Smart Signal data is not available or disabled.",
+        "samples": [],
+        "avgEntryPrice": [],
+        "unrealizedPnl": [],
+        "unrealizedPnlPct": [],
+    }
+
+
+def read_snapshot(db_path: Path, *, symbol: str | None = None, limit: int = 220) -> dict[str, object]:
+    if load_dotenv is not None:
+        load_dotenv(APP_DIR / ".env")
+    smart_enabled = os.getenv("ENABLE_BINANCE_SMART_SIGNAL", "false").strip().lower() in {"1", "true", "yes", "on"}
+
     if not db_path.exists():
         return {
             "dbPath": str(db_path),
             "generatedAt": jst_iso(int(time.time())),
             "symbols": [],
             "selectedSymbol": symbol,
-            "summary": [],
-            "series": [],
+            "summaryCards": {},
+            "series": {},
+            "latestTable": [],
+            "smartSignal": empty_smart_signal(smart_enabled),
             "error": "Database not found. Run main.py first to collect market samples.",
         }
 
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        has_market_samples = (
-            conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'market_samples'"
-            ).fetchone()
-            is not None
-        )
-        table_name = "market_samples" if has_market_samples else "oi_samples"
-        symbols = [
-            row["symbol"]
-            for row in conn.execute(f"SELECT DISTINCT symbol FROM {table_name} ORDER BY symbol")
-        ]
+        table_name = "market_samples" if has_table(conn, "market_samples") else "oi_samples"
+        columns = table_columns(conn, table_name)
+        symbols = [row["symbol"] for row in conn.execute(f"SELECT DISTINCT symbol FROM {table_name} ORDER BY symbol")]
         selected_symbol = symbol if symbol in symbols else (symbols[0] if symbols else None)
-
         if selected_symbol is None:
             return {
                 "dbPath": str(db_path),
                 "generatedAt": jst_iso(int(time.time())),
                 "symbols": [],
                 "selectedSymbol": None,
-                "summary": [],
-                "series": [],
+                "summaryCards": {},
+                "series": {},
+                "latestTable": [],
+                "smartSignal": empty_smart_signal(smart_enabled),
                 "error": "No samples yet. Wait until the notifier collects at least one market sample.",
             }
+        rows_desc = list(conn.execute(f"SELECT * FROM {table_name} WHERE symbol = ? ORDER BY exchange, observed_at DESC", (selected_symbol,)))
+        smart_signal = latest_smart_signal(conn, selected_symbol, limit) if smart_enabled else empty_smart_signal(False)
 
-        rows = list(
-            conn.execute(
-                f"""
-                SELECT *
-                FROM {table_name}
-                WHERE symbol = ?
-                ORDER BY exchange, observed_at DESC
-                """,
-                (selected_symbol,),
-            )
-        )
+    grouped: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in rows_desc:
+        grouped[row["exchange"]].append(row)
 
-    grouped: dict[str, list[sqlite3.Row]] = {}
-    for row in rows:
-        grouped.setdefault(row["exchange"], []).append(row)
-
-    summary: list[dict[str, object]] = []
-    series: list[dict[str, object]] = []
+    exchange_oi_raw = []
+    exchange_oi_normalized = []
+    exchange_volume = []
+    long_ratio_series = []
+    short_ratio_series = []
+    long_short_ratio_series = []
+    taker_buy_series = []
+    taker_sell_series = []
+    taker_ratio_series = []
+    latest_table = []
     latest_times: list[int] = []
+    latest_oi_values: list[Decimal] = []
+    previous_oi_values: list[Decimal] = []
+    latest_volume_values: list[Decimal] = []
+    previous_volume_values: list[Decimal] = []
+    avg_long_ratios: list[float] = []
+    avg_taker_ratios: list[float] = []
+    aggregate_buckets: dict[int, dict[str, Decimal]] = defaultdict(lambda: {"oi": Decimal("0"), "volume": Decimal("0")})
 
     for exchange, exchange_rows_desc in sorted(grouped.items()):
         latest = exchange_rows_desc[0]
         previous = exchange_rows_desc[1] if len(exchange_rows_desc) > 1 else None
-        latest_value = to_decimal(latest["oi_value"])
-        previous_value = to_decimal(previous["oi_value"]) if previous is not None else None
-        latest_times.append(int(latest["observed_at"]))
+        latest_time = int(latest["observed_at"])
+        latest_times.append(latest_time)
+        latest_oi = preferred_decimal(latest, columns, "oi_usdt", "oi_value")
+        previous_oi = preferred_decimal(previous, columns, "oi_usdt", "oi_value") if previous is not None else None
+        latest_volume = preferred_decimal(latest, columns, "volume_30m_usdt", "volume_30m")
+        previous_volume = preferred_decimal(previous, columns, "volume_30m_usdt", "volume_30m") if previous is not None else None
+        if latest_oi is not None:
+            latest_oi_values.append(latest_oi)
+        if previous_oi is not None:
+            previous_oi_values.append(previous_oi)
+        if latest_volume is not None:
+            latest_volume_values.append(latest_volume)
+        if previous_volume is not None:
+            previous_volume_values.append(previous_volume)
 
         ordered = list(reversed(exchange_rows_desc[:limit]))
-        first_value = to_decimal(ordered[0]["oi_value"]) if ordered else Decimal("0")
-        normalized_points = []
-        raw_points = []
-        volume_points = []
-        for item in ordered:
-            value = to_decimal(item["oi_value"])
-            normalized = ((value / first_value) * Decimal("100")) if first_value else Decimal("100")
-            normalized_points.append({"x": jst_iso(int(item["observed_at"])), "y": float(normalized)})
-            raw_points.append({"x": jst_iso(int(item["observed_at"])), "y": fmt_decimal(value)})
-            if has_market_samples and item["volume_30m"] is not None:
-                volume_points.append({"x": jst_iso(int(item["observed_at"])), "y": fmt_decimal(to_decimal(item["volume_30m"]))})
+        raw_points = [point(int(row["observed_at"]), preferred_decimal(row, columns, "oi_usdt", "oi_value")) for row in ordered]
+        volume_points = [point(int(row["observed_at"]), preferred_decimal(row, columns, "volume_30m_usdt", "volume_30m")) for row in ordered]
+        exchange_oi_raw.append({"exchange": exchange, "data": raw_points})
+        exchange_oi_normalized.append({"exchange": exchange, "data": normalize_points(ordered, columns)})
+        exchange_volume.append({"exchange": exchange, "data": volume_points})
+        long_ratio_series.append({"exchange": exchange, "data": [point(int(row["observed_at"]), to_decimal(row_value(row, columns, "long_ratio"))) for row in ordered]})
+        short_ratio_series.append({"exchange": exchange, "data": [point(int(row["observed_at"]), to_decimal(row_value(row, columns, "short_ratio"))) for row in ordered]})
+        long_short_ratio_series.append({"exchange": exchange, "data": [point(int(row["observed_at"]), to_decimal(row_value(row, columns, "long_short_ratio"))) for row in ordered]})
+        taker_buy_series.append({"exchange": exchange, "data": [point(int(row["observed_at"]), preferred_decimal(row, columns, "taker_buy_volume_usdt", "taker_buy_volume")) for row in ordered]})
+        taker_sell_series.append({"exchange": exchange, "data": [point(int(row["observed_at"]), preferred_decimal(row, columns, "taker_sell_volume_usdt", "taker_sell_volume")) for row in ordered]})
+        taker_ratio_series.append({"exchange": exchange, "data": [point(int(row["observed_at"]), to_decimal(row_value(row, columns, "taker_buy_sell_ratio"))) for row in ordered]})
 
-        summary.append(
-            {
-                "exchange": exchange,
-                "latestOi": fmt_decimal(latest_value),
-                "changePct": pct_change(latest_value, previous_value),
-                "volume30m": fmt_decimal(to_decimal(latest["volume_30m"])) if has_market_samples and latest["volume_30m"] is not None else None,
-                "volumeSpike": fmt_decimal(to_decimal(latest["volume_spike"])) if has_market_samples and latest["volume_spike"] is not None else None,
-                "longRatio": fmt_decimal(to_decimal(latest["long_ratio"])) if has_market_samples and latest["long_ratio"] is not None else None,
-                "shortRatio": fmt_decimal(to_decimal(latest["short_ratio"])) if has_market_samples and latest["short_ratio"] is not None else None,
-                "longShortRatio": fmt_decimal(to_decimal(latest["long_short_ratio"])) if has_market_samples and latest["long_short_ratio"] is not None else None,
-                "takerBuySellRatio": fmt_decimal(to_decimal(latest["taker_buy_sell_ratio"])) if has_market_samples and latest["taker_buy_sell_ratio"] is not None else None,
-                "topAccountLongRatio": fmt_decimal(to_decimal(latest["top_account_long_ratio"])) if has_market_samples and latest["top_account_long_ratio"] is not None else None,
-                "topPositionLongRatio": fmt_decimal(to_decimal(latest["top_position_long_ratio"])) if has_market_samples and latest["top_position_long_ratio"] is not None else None,
-                "samples": len(exchange_rows_desc),
-                "lastSeen": jst_iso(int(latest["observed_at"])),
-            }
-        )
-        series.append(
-            {
-                "exchange": exchange,
-                "normalized": normalized_points,
-                "raw": raw_points,
-                "volume": volume_points,
-            }
-        )
+        for row in ordered:
+            bucket = bucket_at(int(row["observed_at"]))
+            oi_value = preferred_decimal(row, columns, "oi_usdt", "oi_value")
+            volume_value = preferred_decimal(row, columns, "volume_30m_usdt", "volume_30m")
+            if oi_value is not None:
+                aggregate_buckets[bucket]["oi"] += oi_value
+            if volume_value is not None:
+                aggregate_buckets[bucket]["volume"] += volume_value
 
-    changes = [item["changePct"] for item in summary if item["changePct"] is not None]
-    market_average = sum(changes) / len(changes) if changes else None
-    long_values = [item["longRatio"] for item in summary if item.get("longRatio") is not None]
-    average_long_ratio = sum(long_values) / len(long_values) if long_values else None
-    volume_spikes = [item["volumeSpike"] for item in summary if item.get("volumeSpike") is not None]
-    average_volume_spike = sum(volume_spikes) / len(volume_spikes) if volume_spikes else None
+        long_ratio = to_decimal(row_value(latest, columns, "long_ratio"))
+        taker_ratio = to_decimal(row_value(latest, columns, "taker_buy_sell_ratio"))
+        if long_ratio is not None:
+            avg_long_ratios.append(float(long_ratio))
+        if taker_ratio is not None:
+            avg_taker_ratios.append(float(taker_ratio))
+        latest_table.append({
+            "exchange": exchange,
+            "oiUsdt": as_float(latest_oi),
+            "oiUsdtText": compact_decimal(latest_oi),
+            "oiRaw": as_float(to_decimal(row_value(latest, columns, "oi_raw"))),
+            "oiRawUnit": row_value(latest, columns, "oi_raw_unit"),
+            "oiChangePct": pct_change(latest_oi, previous_oi),
+            "volume30mUsdt": as_float(latest_volume),
+            "volume30mUsdtText": compact_decimal(latest_volume),
+            "volumeRaw": as_float(to_decimal(row_value(latest, columns, "volume_30m_raw"))),
+            "volumeRawUnit": row_value(latest, columns, "volume_30m_raw_unit"),
+            "volumeSpike": as_float(to_decimal(row_value(latest, columns, "volume_spike"))),
+            "longRatio": as_float(long_ratio),
+            "shortRatio": as_float(to_decimal(row_value(latest, columns, "short_ratio"))),
+            "longShortRatio": as_float(to_decimal(row_value(latest, columns, "long_short_ratio"))),
+            "takerBuyUsdt": as_float(preferred_decimal(latest, columns, "taker_buy_volume_usdt", "taker_buy_volume")),
+            "takerSellUsdt": as_float(preferred_decimal(latest, columns, "taker_sell_volume_usdt", "taker_sell_volume")),
+            "takerBuySellRatio": as_float(taker_ratio),
+            "lastUpdatedJst": jst_iso(latest_time),
+        })
+
+    aggregate_points = [{"x": jst_iso(ts), "oi": as_float(values["oi"]), "volume": as_float(values["volume"])} for ts, values in sorted(aggregate_buckets.items())]
+    total_oi = sum(latest_oi_values, Decimal("0")) if latest_oi_values else None
+    previous_total_oi = sum(previous_oi_values, Decimal("0")) if previous_oi_values else None
+    total_volume = sum(latest_volume_values, Decimal("0")) if latest_volume_values else None
+    previous_total_volume = sum(previous_volume_values, Decimal("0")) if previous_volume_values else None
 
     return {
         "dbPath": str(db_path),
@@ -154,420 +271,87 @@ def read_snapshot(db_path: Path, *, symbol: str | None = None, limit: int = 180)
         "symbols": symbols,
         "selectedSymbol": selected_symbol,
         "latestSampleAt": jst_iso(max(latest_times)) if latest_times else None,
-        "marketAverageChangePct": market_average,
-        "averageLongRatio": average_long_ratio,
-        "averageVolumeSpike": average_volume_spike,
-        "hasMarketSamples": has_market_samples,
-        "summary": summary,
-        "series": series,
+        "summaryCards": {
+            "totalOiUsdt": as_float(total_oi),
+            "totalOiUsdtText": compact_decimal(total_oi),
+            "totalOiChangePct": pct_change(total_oi, previous_total_oi),
+            "totalVolume30mUsdt": as_float(total_volume),
+            "totalVolume30mUsdtText": compact_decimal(total_volume),
+            "totalVolumeChangePct": pct_change(total_volume, previous_total_volume),
+            "averageLongRatio": sum(avg_long_ratios) / len(avg_long_ratios) if avg_long_ratios else None,
+            "averageTakerBuySellRatio": sum(avg_taker_ratios) / len(avg_taker_ratios) if avg_taker_ratios else None,
+        },
+        "series": {
+            "exchangeOiRaw": exchange_oi_raw,
+            "exchangeOiNormalized": exchange_oi_normalized,
+            "exchangeVolume": exchange_volume,
+            "aggregated": aggregate_points,
+            "longRatio": long_ratio_series,
+            "shortRatio": short_ratio_series,
+            "longShortRatio": long_short_ratio_series,
+            "takerBuy": taker_buy_series,
+            "takerSell": taker_sell_series,
+            "takerBuySellRatio": taker_ratio_series,
+        },
+        "latestTable": latest_table,
+        "smartSignal": smart_signal,
         "error": None,
     }
-
 
 HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Position Market Dashboard</title>
+  <title>Market Structure Dashboard</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
-    :root {
-      --ink: #17201c;
-      --muted: #66736d;
-      --paper: #f4f6f1;
-      --panel: #ffffff;
-      --line: #dbe2d6;
-      --good: #11835b;
-      --bad: #c23b3b;
-      --warn: #a96800;
-      --accent: #0d6a7d;
-      --accent-2: #7a5c19;
-      --shadow: 0 18px 45px rgba(43, 54, 48, .11);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      color: var(--ink);
-      font-family: "Segoe UI", "Yu Gothic UI", sans-serif;
-      background:
-        linear-gradient(135deg, rgba(13, 106, 125, .10), transparent 34%),
-        linear-gradient(225deg, rgba(122, 92, 25, .12), transparent 28%),
-        repeating-linear-gradient(0deg, rgba(23, 32, 28, .035), rgba(23, 32, 28, .035) 1px, transparent 1px, transparent 24px),
-        var(--paper);
-    }
-    header {
-      padding: 28px clamp(18px, 3vw, 42px) 18px;
-      border-bottom: 1px solid var(--line);
-      background: rgba(244, 246, 241, .82);
-      backdrop-filter: blur(12px);
-      position: sticky;
-      top: 0;
-      z-index: 5;
-    }
-    .topline {
-      display: flex;
-      align-items: flex-end;
-      justify-content: space-between;
-      gap: 18px;
-      flex-wrap: wrap;
-    }
-    h1 {
-      margin: 0 0 6px;
-      font-size: clamp(26px, 4vw, 46px);
-      letter-spacing: 0;
-      line-height: 1;
-    }
-    .subtitle {
-      color: var(--muted);
-      font-size: 14px;
-    }
-    .controls {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-    select, button {
-      min-height: 38px;
-      border: 1px solid var(--line);
-      background: var(--panel);
-      color: var(--ink);
-      border-radius: 6px;
-      padding: 0 12px;
-      font: inherit;
-      box-shadow: 0 1px 0 rgba(23, 32, 28, .04);
-    }
-    button {
-      cursor: pointer;
-      font-weight: 650;
-      color: white;
-      background: var(--accent);
-      border-color: var(--accent);
-    }
-    main {
-      width: min(1420px, 100%);
-      margin: 0 auto;
-      padding: 24px clamp(14px, 3vw, 42px) 46px;
-    }
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
-      gap: 12px;
-      margin-bottom: 18px;
-    }
-    .metric {
-      background: rgba(255,255,255,.88);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
-      box-shadow: var(--shadow);
-    }
-    .metric span {
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: .08em;
-    }
-    .metric strong {
-      display: block;
-      margin-top: 8px;
-      font-size: 24px;
-      line-height: 1.15;
-    }
-    .layout {
-      display: grid;
-      grid-template-columns: minmax(0, 1.55fr) minmax(340px, .9fr);
-      gap: 16px;
-      align-items: start;
-    }
-    .panel {
-      background: rgba(255,255,255,.9);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: var(--shadow);
-      overflow: hidden;
-    }
-    .panel-title {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 16px 18px;
-      border-bottom: 1px solid var(--line);
-    }
-    .panel-title h2 {
-      margin: 0;
-      font-size: 16px;
-    }
-    .panel-title span {
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .chart-wrap {
-      height: 430px;
-      padding: 16px;
-    }
-    .raw-chart {
-      height: 280px;
-      border-top: 1px solid var(--line);
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 14px;
-    }
-    th, td {
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--line);
-      text-align: right;
-      white-space: nowrap;
-    }
-    th:first-child, td:first-child { text-align: left; }
-    th {
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: .06em;
-      background: rgba(244, 246, 241, .82);
-    }
-    .good { color: var(--good); font-weight: 750; }
-    .bad { color: var(--bad); font-weight: 750; }
-    .flat { color: var(--muted); font-weight: 650; }
-    .heat {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-      padding: 14px;
-    }
-    .heat-cell {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px;
-      min-height: 72px;
-      background: #fff;
-    }
-    .heat-cell b { display: block; font-size: 14px; }
-    .heat-cell span { display: block; margin-top: 8px; font-size: 22px; font-weight: 800; }
-    .error {
-      padding: 18px;
-      color: var(--bad);
-      font-weight: 700;
-    }
-    @media (max-width: 980px) {
-      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .layout { grid-template-columns: 1fr; }
-      .chart-wrap { height: 340px; }
-    }
-    @media (max-width: 560px) {
-      header { position: static; }
-      .metrics { grid-template-columns: 1fr; }
-      .controls { width: 100%; }
-      select, button { width: 100%; }
-      th, td { padding: 10px 8px; font-size: 12px; }
-      .heat { grid-template-columns: 1fr; }
-    }
+    :root { --ink:#18211d; --muted:#68766f; --paper:#f4f7f0; --panel:#fffdf7; --line:#dde5d8; --good:#0f8a62; --bad:#c5463d; --accent:#0c6b78; --gold:#a66a00; --shadow:0 18px 42px rgba(36,48,41,.11); }
+    *{box-sizing:border-box} body{margin:0;color:var(--ink);font-family:"Segoe UI","Yu Gothic UI",sans-serif;background:radial-gradient(circle at top left,rgba(12,107,120,.16),transparent 34%),radial-gradient(circle at 92% 8%,rgba(166,106,0,.14),transparent 28%),linear-gradient(180deg,#fbfcf7,var(--paper));}
+    header{position:sticky;top:0;z-index:5;background:rgba(244,247,240,.88);backdrop-filter:blur(12px);border-bottom:1px solid var(--line);padding:22px clamp(16px,3vw,40px)}
+    .bar{display:flex;align-items:end;justify-content:space-between;gap:18px;flex-wrap:wrap}.eyebrow{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em}h1{margin:4px 0 8px;font-size:clamp(28px,4vw,48px);line-height:1}.sub{color:var(--muted);font-size:14px}.controls{display:flex;gap:10px;flex-wrap:wrap}select,button{height:40px;border:1px solid var(--line);border-radius:10px;padding:0 13px;background:var(--panel);font:inherit}button{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700;cursor:pointer}
+    main{width:min(1480px,100%);margin:auto;padding:22px clamp(14px,3vw,40px) 44px}.cards{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:16px}.card,.panel{background:rgba(255,253,247,.92);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}.card{padding:15px}.card span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.card strong{display:block;margin-top:8px;font-size:clamp(18px,2vw,28px);line-height:1.05}.grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(360px,.8fr);gap:16px}.section{margin-top:16px}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 17px;border-bottom:1px solid var(--line)}.panel-head h2{margin:0;font-size:16px}.panel-head small{color:var(--muted)}.chart{height:360px;padding:14px}.chart.short{height:280px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.toggle{background:#fff;color:var(--accent);border-color:var(--accent)}
+    table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}th{background:rgba(244,247,240,.78);color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}.scroll{overflow:auto}.good{color:var(--good);font-weight:800}.bad{color:var(--bad);font-weight:800}.flat{color:var(--muted);font-weight:700}.heat{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:14px}.heat div{border:1px solid var(--line);border-radius:13px;padding:12px;background:#fff}.heat b{display:block}.heat span{font-size:24px;font-weight:850}.note{color:var(--muted);padding:14px 17px;line-height:1.55}.error{padding:18px;color:var(--bad);font-weight:800}
+    @media(max-width:1100px){.cards{grid-template-columns:repeat(3,1fr)}.grid,.split{grid-template-columns:1fr}}@media(max-width:640px){header{position:static}.cards{grid-template-columns:1fr}.controls,select,button{width:100%}.chart{height:300px}.heat{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
-  <header>
-    <div class="topline">
-      <div>
-        <h1>Market OI Dashboard</h1>
-        <div class="subtitle" id="subtitle">Loading market samples...</div>
-      </div>
-      <div class="controls">
-        <select id="symbolSelect" aria-label="Symbol"></select>
-        <button id="refreshButton">Refresh</button>
-      </div>
+<header><div class="bar"><div><div class="eyebrow">Local Dashboard · Auto refresh 60s</div><h1>Market Structure</h1><div class="sub" id="subtitle">Loading...</div></div><div class="controls"><select id="symbolSelect"></select><button id="oiToggle" class="toggle">Raw OI USDT</button><button id="refreshButton">Refresh</button></div></div></header>
+<main>
+  <section class="cards">
+    <div class="card"><span>Selected Symbol</span><strong id="cSymbol">-</strong></div><div class="card"><span>Total OI USDT</span><strong id="cOi">-</strong></div><div class="card"><span>Total OI Change</span><strong id="cOiChg">-</strong></div><div class="card"><span>Total 30m Volume</span><strong id="cVol">-</strong></div><div class="card"><span>Volume Change</span><strong id="cVolChg">-</strong></div><div class="card"><span>Avg Long / Taker</span><strong id="cBias">-</strong></div>
+  </section>
+  <section class="grid">
+    <div>
+      <div class="panel"><div class="panel-head"><h2>Exchange OI Trend</h2><small id="oiMode">Raw OI USDT</small></div><div class="chart"><canvas id="oiChart"></canvas></div></div>
+      <div class="panel section"><div class="panel-head"><h2>Exchange Volume Trend</h2><small>30m Volume USDT</small></div><div class="chart short"><canvas id="volumeChart"></canvas></div></div>
+      <div class="panel section"><div class="panel-head"><h2>Aggregated Market Trend</h2><small>10m bucket, no gap filling</small></div><div class="chart short"><canvas id="aggChart"></canvas></div></div>
     </div>
-  </header>
-  <main>
-    <section class="metrics">
-      <div class="metric"><span>Symbol</span><strong id="metricSymbol">-</strong></div>
-      <div class="metric"><span>Market Avg OI Change</span><strong id="metricAverage">-</strong></div>
-      <div class="metric"><span>Avg Long Bias</span><strong id="metricLongBias">-</strong></div>
-      <div class="metric"><span>Avg Volume Spike</span><strong id="metricVolumeSpike">-</strong></div>
-      <div class="metric"><span>Latest Sample</span><strong id="metricLatest">-</strong></div>
-    </section>
-    <section class="layout">
-      <div class="panel">
-        <div class="panel-title">
-          <h2>Normalized OI Trend</h2>
-          <span>First visible sample = 100</span>
-        </div>
-        <div class="chart-wrap"><canvas id="normalizedChart"></canvas></div>
-        <div class="panel-title">
-          <h2>Raw OI by Exchange</h2>
-          <span>Use shape, not cross-exchange totals</span>
-        </div>
-        <div class="chart-wrap raw-chart"><canvas id="rawChart"></canvas></div>
-        <div class="panel-title">
-          <h2>30m Volume</h2>
-          <span>Latest closed 30m candle</span>
-        </div>
-        <div class="chart-wrap raw-chart"><canvas id="volumeChart"></canvas></div>
-      </div>
-      <div class="panel">
-        <div class="panel-title">
-          <h2>Exchange Table</h2>
-          <span id="tableNote">Latest rows</span>
-        </div>
-        <div id="tableMount"></div>
-        <div class="panel-title">
-          <h2>Change Heatmap</h2>
-          <span>Last sample vs previous</span>
-        </div>
-        <div class="heat" id="heatMount"></div>
-      </div>
-    </section>
-  </main>
-  <script>
-    let normalizedChart;
-    let rawChart;
-    let volumeChart;
-    let dashboardLoading = false;
-    const colors = ["#0d6a7d", "#b14b2c", "#11835b", "#7a5c19", "#5c6470", "#8f3f65", "#2f6f3e"];
-
-    function formatNumber(value) {
-      if (value === null || value === undefined || Number.isNaN(value)) return "-";
-      return new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(value);
-    }
-
-    function formatPct(value) {
-      if (value === null || value === undefined || Number.isNaN(value)) return "-";
-      const sign = value >= 0 ? "+" : "";
-      return `${sign}${value.toFixed(2)}%`;
-    }
-
-    function formatRatioPct(value) {
-      if (value === null || value === undefined || Number.isNaN(value)) return "-";
-      return `${(value * 100).toFixed(1)}%`;
-    }
-
-    function clsFor(value) {
-      if (value > 0) return "good";
-      if (value < 0) return "bad";
-      return "flat";
-    }
-
-    function buildDatasets(series, key) {
-      return series.map((item, index) => ({
-        label: item.exchange,
-        data: item[key],
-        borderColor: colors[index % colors.length],
-        backgroundColor: colors[index % colors.length],
-        borderWidth: 2,
-        pointRadius: 0,
-        pointHoverRadius: 4,
-        tension: 0.25
-      }));
-    }
-
-    function renderChart(canvasId, existing, series, key, yTitle) {
-      if (existing) existing.destroy();
-      const ctx = document.getElementById(canvasId);
-      return new Chart(ctx, {
-        type: "line",
-        data: { datasets: buildDatasets(series, key) },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          interaction: { mode: "index", intersect: false },
-          parsing: { xAxisKey: "x", yAxisKey: "y" },
-          plugins: {
-            legend: { position: "bottom", labels: { boxWidth: 12, usePointStyle: true } },
-            tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${formatNumber(ctx.parsed.y)}` } }
-          },
-          scales: {
-            x: { type: "category", ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 8 }, grid: { display: false } },
-            y: { title: { display: true, text: yTitle }, grid: { color: "rgba(23,32,28,.08)" } }
-          }
-        }
-      });
-    }
-
-    function renderTable(summary) {
-      if (!summary.length) {
-        document.getElementById("tableMount").innerHTML = `<div class="error">No exchange samples yet.</div>`;
-        return;
-      }
-      const rows = summary.map(item => `
-        <tr>
-          <td>${item.exchange}</td>
-          <td>${formatNumber(item.latestOi)}</td>
-          <td class="${clsFor(item.changePct)}">${formatPct(item.changePct)}</td>
-          <td>${formatRatioPct(item.longRatio)}</td>
-          <td>${item.volumeSpike === null || item.volumeSpike === undefined ? "-" : `${item.volumeSpike.toFixed(2)}x`}</td>
-          <td>${item.takerBuySellRatio === null || item.takerBuySellRatio === undefined ? "-" : item.takerBuySellRatio.toFixed(2)}</td>
-          <td>${formatRatioPct(item.topAccountLongRatio)}</td>
-          <td>${item.samples}</td>
-          <td>${item.lastSeen}</td>
-        </tr>
-      `).join("");
-      document.getElementById("tableMount").innerHTML = `
-        <table>
-          <thead><tr><th>Exchange</th><th>Latest OI</th><th>OI Chg</th><th>Long</th><th>Vol</th><th>Taker B/S</th><th>Smart Long</th><th>Samples</th><th>Last Seen</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table>`;
-    }
-
-    function renderHeat(summary) {
-      const cells = summary.map(item => `
-        <div class="heat-cell">
-          <b>${item.exchange}</b>
-          <span class="${clsFor(item.changePct)}">${formatPct(item.changePct)}</span>
-        </div>
-      `).join("");
-      document.getElementById("heatMount").innerHTML = cells || `<div class="error">No changes yet.</div>`;
-    }
-
-    async function loadDashboard(symbol) {
-      if (dashboardLoading) return;
-      dashboardLoading = true;
-      const qs = symbol ? `?symbol=${encodeURIComponent(symbol)}` : "";
-      try {
-        const separator = qs ? "&" : "?";
-        const response = await fetch(`/api/snapshot${qs}${separator}ts=${Date.now()}`, { cache: "no-store" });
-        const data = await response.json();
-        const select = document.getElementById("symbolSelect");
-        select.innerHTML = data.symbols.map(item => `<option value="${item}">${item}</option>`).join("");
-        if (data.selectedSymbol) select.value = data.selectedSymbol;
-
-        if (data.error) {
-          document.getElementById("subtitle").textContent = data.error;
-          return;
-        }
-
-        document.getElementById("subtitle").textContent = `Generated ${data.generatedAt} JST from ${data.dbPath}`;
-        document.getElementById("metricSymbol").textContent = data.selectedSymbol;
-        document.getElementById("metricAverage").textContent = formatPct(data.marketAverageChangePct);
-        document.getElementById("metricAverage").className = clsFor(data.marketAverageChangePct);
-        document.getElementById("metricLongBias").textContent = formatRatioPct(data.averageLongRatio);
-        document.getElementById("metricLongBias").className = data.averageLongRatio >= 0.5 ? "good" : "bad";
-        document.getElementById("metricVolumeSpike").textContent = data.averageVolumeSpike === null || data.averageVolumeSpike === undefined ? "-" : `${data.averageVolumeSpike.toFixed(2)}x`;
-        document.getElementById("metricLatest").textContent = data.latestSampleAt || "-";
-        document.getElementById("tableNote").textContent = `${data.summary.length} exchanges`;
-
-        normalizedChart = renderChart("normalizedChart", normalizedChart, data.series, "normalized", "Normalized OI");
-        rawChart = renderChart("rawChart", rawChart, data.series, "raw", "Raw OI");
-        volumeChart = renderChart("volumeChart", volumeChart, data.series, "volume", "30m Volume");
-        renderTable(data.summary);
-        renderHeat(data.summary);
-      } finally {
-        dashboardLoading = false;
-      }
-    }
-
-    document.getElementById("symbolSelect").addEventListener("change", event => loadDashboard(event.target.value));
-    document.getElementById("refreshButton").addEventListener("click", () => loadDashboard(document.getElementById("symbolSelect").value));
-    loadDashboard();
-    setInterval(() => loadDashboard(document.getElementById("symbolSelect").value), 20000);
-  </script>
-</body>
-</html>
-"""
+    <div>
+      <div class="panel"><div class="panel-head"><h2>OI Change Heatmap</h2><small>Latest vs previous</small></div><div id="heat" class="heat"></div></div>
+      <div class="panel section"><div class="panel-head"><h2>Latest Exchange Table</h2><small>USDT first, raw fallback</small></div><div id="table" class="scroll"></div></div>
+    </div>
+  </section>
+  <section class="split section">
+    <div class="panel"><div class="panel-head"><h2>Long/Short Structure</h2><small>Account ratio by exchange</small></div><div class="chart short"><canvas id="lsChart"></canvas></div></div>
+    <div class="panel"><div class="panel-head"><h2>Long/Short Volume Trend</h2><small>Taker buy/sell volume, definitions vary by exchange</small></div><div class="note">Long/Short Volume is not standardized across exchanges. Where direct long/short volume is unavailable, this dashboard shows Taker Buy/Sell Volume in USDT.</div><div class="chart short"><canvas id="takerChart"></canvas></div></div>
+  </section>
+  <section class="panel section" id="smartPanel"><div class="panel-head"><h2>Binance Smart Money / Smart Signal</h2><small>Safe public endpoint only</small></div><div class="note" id="smartNote"></div><div class="chart short"><canvas id="smartChart"></canvas></div></section>
+</main>
+<script>
+let charts={}, currentData=null, oiNormalized=false; const colors=["#0c6b78","#c45b32","#0f8a62","#a66a00","#56616b","#954c72","#2f6f3e"];
+const fmt=n=>n==null||Number.isNaN(n)?"N/A":new Intl.NumberFormat("en-US",{maximumFractionDigits:2}).format(n);
+const pct=n=>n==null||Number.isNaN(n)?"N/A":`${n>=0?"+":""}${n.toFixed(2)}%`; const cls=n=>n>0?"good":n<0?"bad":"flat"; const ratio=n=>n==null?"N/A":`${(n*100).toFixed(1)}%`;
+function compact(n){if(n==null||Number.isNaN(n))return"N/A"; const a=Math.abs(n); if(a>=1e9)return`${(n/1e9).toFixed(2)}B USDT`; if(a>=1e6)return`${(n/1e6).toFixed(2)}M USDT`; if(a>=1e3)return`${(n/1e3).toFixed(2)}K USDT`; return`${n.toFixed(2)} USDT`;}
+function datasets(series){return series.map((s,i)=>({label:s.exchange,data:s.data,borderColor:colors[i%colors.length],backgroundColor:colors[i%colors.length],borderWidth:2,pointRadius:0,tension:.25,spanGaps:false}));}
+function chart(id, type, data, yTitle){if(charts[id])charts[id].destroy(); charts[id]=new Chart(document.getElementById(id),{type,data,options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},parsing:{xAxisKey:"x",yAxisKey:"y"},plugins:{legend:{position:"bottom",labels:{boxWidth:12,usePointStyle:true}},tooltip:{callbacks:{label:c=>`${c.dataset.label}: ${fmt(c.parsed.y)}`}}},scales:{x:{type:"category",ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:8},grid:{display:false}},y:{title:{display:true,text:yTitle},grid:{color:"rgba(24,33,29,.08)"}}}}});}
+function renderCharts(d){const oiSeries=oiNormalized?d.series.exchangeOiNormalized:d.series.exchangeOiRaw; document.getElementById("oiMode").textContent=oiNormalized?"Normalized OI (first sample = 100)":"Raw OI USDT"; document.getElementById("oiToggle").textContent=oiNormalized?"Normalized OI":"Raw OI USDT"; chart("oiChart","line",{datasets:datasets(oiSeries)},oiNormalized?"Normalized OI":"OI USDT"); chart("volumeChart","line",{datasets:datasets(d.series.exchangeVolume)},"30m Volume USDT"); chart("aggChart","line",{datasets:[{label:"Aggregated OI USDT",data:d.series.aggregated.map(p=>({x:p.x,y:p.oi})),borderColor:colors[0],backgroundColor:colors[0],borderWidth:2,pointRadius:0,tension:.25},{label:"Aggregated Volume USDT",data:d.series.aggregated.map(p=>({x:p.x,y:p.volume})),borderColor:colors[3],backgroundColor:colors[3],borderWidth:2,pointRadius:0,tension:.25}]},"USDT"); chart("lsChart","line",{datasets:[...datasets(d.series.longRatio),...datasets(d.series.shortRatio).map(x=>({...x,borderDash:[5,4]}))]},"Ratio"); chart("takerChart","line",{datasets:[...datasets(d.series.takerBuy),...datasets(d.series.takerSell).map(x=>({...x,borderDash:[5,4]}))]},"USDT"); const smart=d.smartSignal; document.getElementById("smartNote").textContent=smart.samples.length?smart.note:"Smart Signal data is not available or disabled. "+smart.note; chart("smartChart","line",{datasets:[{label:"Avg Entry Price",data:smart.avgEntryPrice,borderColor:colors[0],backgroundColor:colors[0],pointRadius:0},{label:"Unrealized PnL USDT",data:smart.unrealizedPnl,borderColor:colors[1],backgroundColor:colors[1],pointRadius:0},{label:"Unrealized PnL % / ROI",data:smart.unrealizedPnlPct,borderColor:colors[2],backgroundColor:colors[2],pointRadius:0}]},"Value");}
+function renderTable(rows){document.getElementById("table").innerHTML=`<table><thead><tr><th>Exchange</th><th>OI USDT</th><th>OI raw</th><th>OI Chg</th><th>30m Vol USDT</th><th>Vol raw</th><th>Spike</th><th>Long</th><th>Short</th><th>Taker Buy</th><th>Taker Sell</th><th>Updated</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${r.exchange}</td><td>${r.oiUsdtText}</td><td>${fmt(r.oiRaw)} ${r.oiRawUnit||""}</td><td class="${cls(r.oiChangePct)}">${pct(r.oiChangePct)}</td><td>${r.volume30mUsdtText}</td><td>${fmt(r.volumeRaw)} ${r.volumeRawUnit||""}</td><td>${r.volumeSpike==null?"N/A":r.volumeSpike.toFixed(2)+"x"}</td><td>${ratio(r.longRatio)}</td><td>${ratio(r.shortRatio)}</td><td>${compact(r.takerBuyUsdt)}</td><td>${compact(r.takerSellUsdt)}</td><td>${r.lastUpdatedJst}</td></tr>`).join("")}</tbody></table>`;}
+function renderHeat(rows){document.getElementById("heat").innerHTML=rows.map(r=>`<div><b>${r.exchange}</b><span class="${cls(r.oiChangePct)}">${pct(r.oiChangePct)}</span></div>`).join("")||`<div>No data</div>`;}
+async function load(symbol){const qs=symbol?`?symbol=${encodeURIComponent(symbol)}&ts=${Date.now()}`:`?ts=${Date.now()}`; const d=await (await fetch(`/api/snapshot${qs}`,{cache:"no-store"})).json(); currentData=d; const sel=document.getElementById("symbolSelect"); sel.innerHTML=d.symbols.map(s=>`<option value="${s}">${s}</option>`).join(""); if(d.selectedSymbol)sel.value=d.selectedSymbol; if(d.error){document.getElementById("subtitle").textContent=d.error; return;} document.getElementById("subtitle").textContent=`${d.selectedSymbol} · latest ${d.latestSampleAt||"N/A"} JST · generated ${d.generatedAt} JST`; const c=d.summaryCards; document.getElementById("cSymbol").textContent=d.selectedSymbol; document.getElementById("cOi").textContent=c.totalOiUsdtText; document.getElementById("cOiChg").textContent=pct(c.totalOiChangePct); document.getElementById("cOiChg").className=cls(c.totalOiChangePct); document.getElementById("cVol").textContent=c.totalVolume30mUsdtText; document.getElementById("cVolChg").textContent=pct(c.totalVolumeChangePct); document.getElementById("cVolChg").className=cls(c.totalVolumeChangePct); document.getElementById("cBias").textContent=`${ratio(c.averageLongRatio)} / ${fmt(c.averageTakerBuySellRatio)}`; renderCharts(d); renderTable(d.latestTable); renderHeat(d.latestTable);}
+document.getElementById("symbolSelect").addEventListener("change",e=>load(e.target.value)); document.getElementById("refreshButton").addEventListener("click",()=>load(document.getElementById("symbolSelect").value)); document.getElementById("oiToggle").addEventListener("click",()=>{oiNormalized=!oiNormalized;if(currentData)renderCharts(currentData);}); load(); setInterval(()=>load(document.getElementById("symbolSelect").value),60000);
+</script>
+</body></html>"""
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -608,7 +392,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a local dashboard for market OI samples.")
+    parser = argparse.ArgumentParser(description="Run a local dashboard for market structure samples.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH))

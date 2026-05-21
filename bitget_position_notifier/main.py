@@ -94,6 +94,16 @@ def format_ratio_percent(value: Decimal | None) -> str:
     return f"{format_decimal(value * Decimal('100'), places=1)}%"
 
 
+def format_compact_usdt(value: Decimal | None) -> str:
+    if value is None:
+        return "N/A"
+    abs_value = abs(value)
+    for suffix, divisor in (("B", Decimal("1000000000")), ("M", Decimal("1000000")), ("K", Decimal("1000"))):
+        if abs_value >= divisor:
+            return f"{format_decimal(value / divisor, places=1)}{suffix} USDT"
+    return f"{format_decimal(value, places=2)} USDT"
+
+
 def find_exchange_metric(metrics: SymbolMarketMetrics, exchange: str) -> Any | None:
     for metric in metrics.exchange_metrics:
         if metric.exchange == exchange:
@@ -124,6 +134,16 @@ def format_market_metrics(metrics: SymbolMarketMetrics | None) -> list[str]:
     avg_oi_change = average_decimal(oi_changes)
     avg_volume_spike = average_decimal(volume_spikes)
     avg_long_ratio = average_decimal(long_ratios)
+    oi_values_usdt = [
+        exchange_metric.oi_usdt
+        for exchange_metric in metrics.exchange_metrics
+        if getattr(exchange_metric, "oi_usdt", None) is not None
+    ]
+    volume_values_usdt = [
+        exchange_metric.volume_30m_usdt
+        for exchange_metric in metrics.exchange_metrics
+        if getattr(exchange_metric, "volume_30m_usdt", None) is not None
+    ]
     binance = find_exchange_metric(metrics, "Binance")
 
     oi_text = (
@@ -143,7 +163,8 @@ def format_market_metrics(metrics: SymbolMarketMetrics | None) -> list[str]:
 
     return [
         "**Market**",
-        f"`OI` {oi_text}  |  `Vol` {volume_text}  |  `Listed` {listed_count}/{exchange_count}",
+        f"`OI` {oi_text}  |  `OI Total` {format_compact_usdt(sum(oi_values_usdt, Decimal('0')) if oi_values_usdt else None)}",
+        f"`Vol` {volume_text}  |  `30m Vol` {format_compact_usdt(sum(volume_values_usdt, Decimal('0')) if volume_values_usdt else None)}  |  `Listed` {listed_count}/{exchange_count}",
         f"`L/S` Long {format_ratio_percent(avg_long_ratio)}  |  Binance Smart {format_ratio_percent(binance.top_account_long_ratio if binance else None)}",
         f"`Taker` Buy/Sell {format_decimal(binance.taker_buy_sell_ratio, places=2) if binance and binance.taker_buy_sell_ratio is not None else 'N/A'}",
         f"`{breakdown}`",
