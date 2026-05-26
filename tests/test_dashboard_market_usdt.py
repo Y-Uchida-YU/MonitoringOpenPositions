@@ -11,6 +11,7 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from dashboard import read_snapshot
+from main import held_positions_from
 from market_metrics import ExchangeMetric, MarketMetricStore, convert_to_usdt, normalize_symbol
 from smart_signal import SmartSignalSample, SmartSignalStore
 
@@ -141,3 +142,77 @@ def test_smart_signal_disabled_and_sample_series(tmp_path: Path, monkeypatch) ->
     enabled = read_snapshot(db_path, symbol="SOLUSDT")
     assert enabled["smartSignal"]["avgEntryPrice"][0]["y"] == 150.0
     assert enabled["smartSignal"]["unrealizedPnl"][0]["y"] == 42.0
+
+
+def test_held_positions_excludes_zero_and_missing_symbols() -> None:
+    positions = [
+        {"symbol": "BTCUSDT", "total": "0.01"},
+        {"symbol": "ETHUSDT", "total": "0", "available": "2"},
+        {"symbol": "SOLUSDT", "holdVolume": "-3"},
+        {"symbol": "XRPUSDT", "available": "4"},
+        {"symbol": "", "total": "2"},
+        {"total": "2"},
+        {"symbol": "DOGEUSDT", "size": None},
+    ]
+    assert [item["symbol"] for item in held_positions_from(positions)] == ["BTCUSDT", "SOLUSDT", "XRPUSDT"]
+
+
+def test_prune_symbols_removes_non_held_market_oi_and_smart_signal(tmp_path: Path) -> None:
+    db_path = tmp_path / "prune.sqlite3"
+    store = MarketMetricStore(db_path)
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        store.save_oi("Binance", symbol, 1_800, Decimal("10"))
+        store.save_market_sample(symbol, 1_800, ExchangeMetric(exchange="Binance", oi_value=Decimal("10")))
+    smart_store = SmartSignalStore(db_path)
+    smart_store.save_samples(
+        [
+            SmartSignalSample(1_800, "stub", "BTCUSDT", "BTC-USDT"),
+            SmartSignalSample(1_800, "stub", "ETHUSDT", "ETH-USDT"),
+        ]
+    )
+
+    store.prune_symbols_not_in({"BTCUSDT"})
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT DISTINCT symbol FROM market_samples").fetchall() == [("BTCUSDT",)]
+        assert conn.execute("SELECT DISTINCT symbol FROM oi_samples").fetchall() == [("BTCUSDT",)]
+        assert conn.execute("SELECT DISTINCT normalized_symbol FROM smart_signal_samples").fetchall() == [("BTC-USDT",)]
+    snapshot = read_snapshot(db_path)
+    assert snapshot["symbols"] == ["BTCUSDT"]
+
+
+def test_prune_with_no_held_symbols_empties_dashboard_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "empty.sqlite3"
+    store = MarketMetricStore(db_path)
+    store.save_oi("Binance", "BTCUSDT", 1_800, Decimal("10"))
+    store.save_market_sample("BTCUSDT", 1_800, ExchangeMetric(exchange="Binance", oi_value=Decimal("10")))
+    smart_store = SmartSignalStore(db_path)
+    smart_store.save_samples([SmartSignalSample(1_800, "stub", "BTCUSDT", "BTC-USDT")])
+
+    store.prune_symbols_not_in(set())
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM market_samples").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM oi_samples").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM smart_signal_samples").fetchone()[0] == 0
+    snapshot = read_snapshot(db_path)
+    assert snapshot["symbols"] == []
+    assert snapshot["error"] == "No current held symbols. Dashboard will populate after a position is opened."
+
+
+def test_previous_oi_prefers_market_usdt_then_market_value_then_legacy_oi(tmp_path: Path) -> None:
+    db_path = tmp_path / "previous.sqlite3"
+    store = MarketMetricStore(db_path)
+    store.save_oi("Binance", "BTCUSDT", 1_000, Decimal("1"))
+    store.save_market_sample(
+        "BTCUSDT",
+        1_100,
+        ExchangeMetric(exchange="Binance", oi_value=Decimal("20"), oi_usdt=Decimal("200")),
+    )
+    assert store.previous_oi_usdt("Binance", "BTCUSDT", 1_200) == Decimal("200")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE market_samples SET oi_usdt = NULL WHERE symbol = 'BTCUSDT'")
+    assert store.previous_oi_usdt("Binance", "BTCUSDT", 1_200) == Decimal("20")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM market_samples WHERE symbol = 'BTCUSDT'")
+    assert store.previous_oi_usdt("Binance", "BTCUSDT", 1_200) == Decimal("1")

@@ -15,6 +15,7 @@ It does not place orders or execute trades.
 - Keeps running even if API or Discord fails temporarily
 - Uses `Decimal` for numeric parsing and aggregation
 - Optional free public market metrics from Binance, Bybit, Bitget, OKX, Gate, and Hyperliquid
+- Dashboard and stored market metrics are limited to symbols with currently held non-zero Bitget positions
 
 ## Directory Structure
 
@@ -112,6 +113,8 @@ The tests do not call live Bitget APIs or Discord webhooks.
 
 The dashboard reads saved market samples from SQLite and runs locally without extra Python dependencies.
 
+This is a held-position monitoring dashboard, not a full-market scanner. Each successful position polling cycle keeps only symbols with a current non-zero Bitget position. Historical `market_samples`, `oi_samples`, and Smart Signal samples for symbols no longer held are automatically removed.
+
 ```powershell
 python dashboard.py
 ```
@@ -153,6 +156,8 @@ The SQLite `market_samples` table keeps both raw and converted values:
 - Price provenance: `price_usdt`, `conversion_source`
 
 Existing compatibility columns such as `oi_value`, `volume_30m`, `taker_buy_volume`, and `taker_sell_volume` remain in place. New dashboard calculations prefer `*_usdt` columns and fall back to legacy columns only when USDT values are unavailable.
+
+New OI change calculations prioritize the prior `market_samples.oi_usdt` value, then compatible `market_samples.oi_value`, and only use legacy `oi_samples.oi_value` as a final fallback.
 
 The database is stored at:
 
