@@ -164,7 +164,7 @@ def read_snapshot(db_path: Path, *, symbol: str | None = None, limit: int = 220)
                 "series": {},
                 "latestTable": [],
                 "smartSignal": empty_smart_signal(smart_enabled),
-                "error": "No samples yet. Wait until the notifier collects at least one market sample.",
+                "error": "No current held symbols. Dashboard will populate after a position is opened.",
             }
         rows_desc = list(conn.execute(f"SELECT * FROM {table_name} WHERE symbol = ? ORDER BY exchange, observed_at DESC", (selected_symbol,)))
         smart_signal = latest_smart_signal(conn, selected_symbol, limit) if smart_enabled else empty_smart_signal(False)

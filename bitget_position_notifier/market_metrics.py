@@ -272,8 +272,55 @@ class MarketMetricStore:
             cutoff = observed_at - 7 * 24 * 60 * 60
             conn.execute("DELETE FROM market_samples WHERE observed_at < ?", (cutoff,))
 
-    def previous_oi(self, exchange: str, symbol: str, before_at: int) -> Decimal | None:
+    def prune_symbols_not_in(self, held_symbols: set[str]) -> None:
+        normalized_symbols = {normalize_symbol(symbol) for symbol in held_symbols}
         with self._connect() as conn:
+            if held_symbols:
+                symbol_placeholders = ",".join("?" for _ in held_symbols)
+                conn.execute(
+                    f"DELETE FROM market_samples WHERE symbol NOT IN ({symbol_placeholders})",
+                    tuple(sorted(held_symbols)),
+                )
+                conn.execute(
+                    f"DELETE FROM oi_samples WHERE symbol NOT IN ({symbol_placeholders})",
+                    tuple(sorted(held_symbols)),
+                )
+            else:
+                conn.execute("DELETE FROM market_samples")
+                conn.execute("DELETE FROM oi_samples")
+
+            smart_signal_exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'smart_signal_samples'"
+            ).fetchone()
+            if not smart_signal_exists:
+                return
+            if normalized_symbols:
+                normalized_placeholders = ",".join("?" for _ in normalized_symbols)
+                conn.execute(
+                    f"DELETE FROM smart_signal_samples WHERE normalized_symbol NOT IN ({normalized_placeholders})",
+                    tuple(sorted(normalized_symbols)),
+                )
+            else:
+                conn.execute("DELETE FROM smart_signal_samples")
+
+    def previous_oi_usdt(self, exchange: str, symbol: str, before_at: int) -> Decimal | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT oi_usdt, oi_value
+                FROM market_samples
+                WHERE exchange = ? AND symbol = ? AND observed_at < ?
+                ORDER BY observed_at DESC
+                LIMIT 1
+                """,
+                (exchange, symbol, before_at),
+            ).fetchone()
+            if row is not None:
+                previous_market_value = optional_decimal(row[0])
+                if previous_market_value is None:
+                    previous_market_value = optional_decimal(row[1])
+                if previous_market_value is not None:
+                    return previous_market_value
             row = conn.execute(
                 """
                 SELECT oi_value
@@ -284,9 +331,10 @@ class MarketMetricStore:
                 """,
                 (exchange, symbol, before_at),
             ).fetchone()
-        if row is None:
-            return None
-        return to_decimal(row[0])
+        return optional_decimal(row[0]) if row is not None else None
+
+    def previous_oi(self, exchange: str, symbol: str, before_at: int) -> Decimal | None:
+        return self.previous_oi_usdt(exchange, symbol, before_at)
 
 
 class MarketDataError(Exception):
@@ -876,7 +924,7 @@ class MarketMetricService:
         oi_raw = client.fetch_oi(source_symbol)
         oi_usdt = convert_to_usdt(oi_raw, client.oi_raw_unit, price_usdt)
         oi_value = oi_usdt if oi_usdt is not None else oi_raw
-        previous = self.store.previous_oi(client.name, symbol, observed_at)
+        previous = self.store.previous_oi_usdt(client.name, symbol, observed_at)
         oi_change = pct_change(oi_value, previous)
 
         volumes = client.fetch_recent_30m_volumes(source_symbol)

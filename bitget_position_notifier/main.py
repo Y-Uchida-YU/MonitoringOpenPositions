@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from bitget_client import BitgetApiError, BitgetClient
 from config import load_config
 from discord_notifier import DiscordNotifier, DiscordNotifierError
-from market_metrics import MarketMetricService, SymbolMarketMetrics
+from market_metrics import MarketMetricService, MarketMetricStore, SymbolMarketMetrics
 
 JST = ZoneInfo("Asia/Tokyo")
 MAX_FIELDS_PER_EMBED = 25
@@ -51,6 +51,26 @@ def format_optional_decimal(raw_value: Any, *, places: int = 4) -> str:
     if raw_value in (None, ""):
         return "N/A"
     return format_decimal(decimal_from_value(raw_value), places=places)
+
+
+def position_size(position: dict[str, Any]) -> Decimal:
+    primary_fields = ("total", "holdVolume", "size", "positionSize", "positionAmt")
+    primary_values = [
+        abs(decimal_from_value(position.get(field)))
+        for field in primary_fields
+        if position.get(field) not in (None, "")
+    ]
+    if primary_values:
+        return max(primary_values)
+    return abs(decimal_from_value(position.get("available")))
+
+
+def held_positions_from(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        position
+        for position in positions
+        if position.get("symbol") and position_size(position) > Decimal("0")
+    ]
 
 
 def pnl_indicator(value: Decimal) -> str:
@@ -346,11 +366,12 @@ def run() -> None:
         username=config.discord_username,
     )
     market_metric_service = None
+    market_db_path = app_dir / config.market_metrics_db_path
     if config.enable_market_metrics:
         market_metric_service = MarketMetricService(
             exchange_names=list(config.market_data_exchanges),
             timeout_seconds=config.request_timeout_seconds,
-            db_path=app_dir / config.market_metrics_db_path,
+            db_path=market_db_path,
         )
 
     logger.info(
@@ -370,19 +391,28 @@ def run() -> None:
                 product_type=config.product_type,
                 margin_coin=config.margin_coin,
             )
-            symbols = sorted({str(position.get("symbol")) for position in positions if position.get("symbol")})
+            held_positions = held_positions_from(positions)
+            symbols = sorted({str(position["symbol"]) for position in held_positions})
+            if market_metric_service is not None:
+                market_metric_service.store.prune_symbols_not_in(set(symbols))
+            elif market_db_path.exists():
+                MarketMetricStore(market_db_path).prune_symbols_not_in(set(symbols))
             market_metrics_by_symbol = (
                 market_metric_service.fetch_for_symbols(symbols)
                 if market_metric_service is not None and symbols
                 else {}
             )
             embeds = build_position_embeds(
-                positions,
+                held_positions,
                 product_type=config.product_type,
                 market_metrics_by_symbol=market_metrics_by_symbol,
             )
             send_embeds_in_batches(notifier, embeds)
-            logger.info("Position notification sent successfully (positions=%d)", len(positions))
+            logger.info(
+                "Position notification sent successfully (positions=%d, held_symbols=%s)",
+                len(held_positions),
+                ",".join(symbols) or "none",
+            )
 
         except BitgetApiError as exc:
             logger.exception("Bitget API error")
