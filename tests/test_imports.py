@@ -15,4 +15,5 @@ def test_core_modules_import() -> None:
     import discord_notifier  # noqa: F401
     import main  # noqa: F401
     import market_metrics  # noqa: F401
+    import risk_score  # noqa: F401
     import smart_signal  # noqa: F401

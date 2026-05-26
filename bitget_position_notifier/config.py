@@ -24,6 +24,7 @@ class Config:
     market_metrics_db_path: str = "data/market_metrics.sqlite3"
     enable_binance_smart_signal: bool = False
     binance_smart_signal_symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+    enable_risk_score: bool = True
 
 
 def _require_env(name: str) -> str:
@@ -75,4 +76,5 @@ def load_config() -> Config:
             for symbol in os.getenv("BINANCE_SMART_SIGNAL_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",")
             if symbol.strip()
         ),
+        enable_risk_score=os.getenv("ENABLE_RISK_SCORE", "true").strip().lower() in {"1", "true", "yes", "on"},
     )

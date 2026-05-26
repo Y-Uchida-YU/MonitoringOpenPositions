@@ -130,6 +130,60 @@ def empty_smart_signal(enabled: bool) -> dict[str, object]:
     }
 
 
+def empty_risk_scores() -> dict[str, object]:
+    return {"selected": [], "latestBySymbol": [], "highest": None}
+
+
+def latest_risk_scores(conn: sqlite3.Connection, selected_symbol: str) -> dict[str, object]:
+    if not has_table(conn, "risk_scores"):
+        return empty_risk_scores()
+
+    rows = list(
+        conn.execute(
+            """
+            SELECT r.*
+            FROM risk_scores r
+            INNER JOIN (
+                SELECT normalized_symbol, side, MAX(observed_at) AS latest_at
+                FROM risk_scores
+                GROUP BY normalized_symbol, side
+            ) latest ON latest.normalized_symbol = r.normalized_symbol
+                AND latest.side = r.side AND latest.latest_at = r.observed_at
+            ORDER BY r.score DESC, r.symbol, r.side
+            """
+        )
+    )
+
+    def serialize(row: sqlite3.Row) -> dict[str, object]:
+        try:
+            reasons = json.loads(row["reasons_json"] or "[]")
+        except json.JSONDecodeError:
+            reasons = []
+        return {
+            "symbol": row["symbol"],
+            "side": row["side"],
+            "score": row["score"],
+            "level": row["level"],
+            "pnlScore": row["pnl_score"],
+            "crowdingScore": row["crowding_score"],
+            "oiScore": row["oi_score"],
+            "volumeScore": row["volume_score"],
+            "takerScore": row["taker_score"],
+            "dispersionScore": row["dispersion_score"],
+            "reasons": reasons,
+            "observedAt": jst_iso(int(row["observed_at"])),
+        }
+
+    serialized = [serialize(row) for row in rows]
+    normalized_selected = normalize_symbol(selected_symbol)
+    selected = [item for item, row in zip(serialized, rows) if row["normalized_symbol"] == normalized_selected]
+    return {
+        "selected": selected,
+        "latestBySymbol": serialized,
+        "highest": serialized[0] if serialized else None,
+    }
+
+
 def read_snapshot(db_path: Path, *, symbol: str | None = None, limit: int = 220) -> dict[str, object]:
     if load_dotenv is not None:
         load_dotenv(APP_DIR / ".env")
@@ -145,14 +199,26 @@ def read_snapshot(db_path: Path, *, symbol: str | None = None, limit: int = 220)
             "series": {},
             "latestTable": [],
             "smartSignal": empty_smart_signal(smart_enabled),
+            "riskScores": empty_risk_scores(),
             "error": "Database not found. Run main.py first to collect market samples.",
         }
 
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        table_name = "market_samples" if has_table(conn, "market_samples") else "oi_samples"
-        columns = table_columns(conn, table_name)
-        symbols = [row["symbol"] for row in conn.execute(f"SELECT DISTINCT symbol FROM {table_name} ORDER BY symbol")]
+        table_name = (
+            "market_samples"
+            if has_table(conn, "market_samples")
+            else ("oi_samples" if has_table(conn, "oi_samples") else None)
+        )
+        columns = table_columns(conn, table_name) if table_name is not None else set()
+        symbol_values = (
+            {row["symbol"] for row in conn.execute(f"SELECT DISTINCT symbol FROM {table_name}")}
+            if table_name is not None
+            else set()
+        )
+        if has_table(conn, "risk_scores"):
+            symbol_values.update(row["symbol"] for row in conn.execute("SELECT DISTINCT symbol FROM risk_scores"))
+        symbols = sorted(symbol_values)
         selected_symbol = symbol if symbol in symbols else (symbols[0] if symbols else None)
         if selected_symbol is None:
             return {
@@ -164,10 +230,16 @@ def read_snapshot(db_path: Path, *, symbol: str | None = None, limit: int = 220)
                 "series": {},
                 "latestTable": [],
                 "smartSignal": empty_smart_signal(smart_enabled),
+                "riskScores": empty_risk_scores(),
                 "error": "No current held symbols. Dashboard will populate after a position is opened.",
             }
-        rows_desc = list(conn.execute(f"SELECT * FROM {table_name} WHERE symbol = ? ORDER BY exchange, observed_at DESC", (selected_symbol,)))
+        rows_desc = (
+            list(conn.execute(f"SELECT * FROM {table_name} WHERE symbol = ? ORDER BY exchange, observed_at DESC", (selected_symbol,)))
+            if table_name is not None
+            else []
+        )
         smart_signal = latest_smart_signal(conn, selected_symbol, limit) if smart_enabled else empty_smart_signal(False)
+        risk_scores = latest_risk_scores(conn, selected_symbol)
 
     grouped: dict[str, list[sqlite3.Row]] = defaultdict(list)
     for row in rows_desc:
@@ -295,6 +367,7 @@ def read_snapshot(db_path: Path, *, symbol: str | None = None, limit: int = 220)
         },
         "latestTable": latest_table,
         "smartSignal": smart_signal,
+        "riskScores": risk_scores,
         "error": None,
     }
 
@@ -310,17 +383,18 @@ HTML = r"""<!doctype html>
     *{box-sizing:border-box} body{margin:0;color:var(--ink);font-family:"Segoe UI","Yu Gothic UI",sans-serif;background:radial-gradient(circle at top left,rgba(12,107,120,.16),transparent 34%),radial-gradient(circle at 92% 8%,rgba(166,106,0,.14),transparent 28%),linear-gradient(180deg,#fbfcf7,var(--paper));}
     header{position:sticky;top:0;z-index:5;background:rgba(244,247,240,.88);backdrop-filter:blur(12px);border-bottom:1px solid var(--line);padding:22px clamp(16px,3vw,40px)}
     .bar{display:flex;align-items:end;justify-content:space-between;gap:18px;flex-wrap:wrap}.eyebrow{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em}h1{margin:4px 0 8px;font-size:clamp(28px,4vw,48px);line-height:1}.sub{color:var(--muted);font-size:14px}.controls{display:flex;gap:10px;flex-wrap:wrap}select,button{height:40px;border:1px solid var(--line);border-radius:10px;padding:0 13px;background:var(--panel);font:inherit}button{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700;cursor:pointer}
-    main{width:min(1480px,100%);margin:auto;padding:22px clamp(14px,3vw,40px) 44px}.cards{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:16px}.card,.panel{background:rgba(255,253,247,.92);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}.card{padding:15px}.card span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.card strong{display:block;margin-top:8px;font-size:clamp(18px,2vw,28px);line-height:1.05}.grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(360px,.8fr);gap:16px}.section{margin-top:16px}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 17px;border-bottom:1px solid var(--line)}.panel-head h2{margin:0;font-size:16px}.panel-head small{color:var(--muted)}.chart{height:360px;padding:14px}.chart.short{height:280px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.toggle{background:#fff;color:var(--accent);border-color:var(--accent)}
-    table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}th{background:rgba(244,247,240,.78);color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}.scroll{overflow:auto}.good{color:var(--good);font-weight:800}.bad{color:var(--bad);font-weight:800}.flat{color:var(--muted);font-weight:700}.heat{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:14px}.heat div{border:1px solid var(--line);border-radius:13px;padding:12px;background:#fff}.heat b{display:block}.heat span{font-size:24px;font-weight:850}.note{color:var(--muted);padding:14px 17px;line-height:1.55}.error{padding:18px;color:var(--bad);font-weight:800}
-    @media(max-width:1100px){.cards{grid-template-columns:repeat(3,1fr)}.grid,.split{grid-template-columns:1fr}}@media(max-width:640px){header{position:static}.cards{grid-template-columns:1fr}.controls,select,button{width:100%}.chart{height:300px}.heat{grid-template-columns:1fr}}
+    main{width:min(1480px,100%);margin:auto;padding:22px clamp(14px,3vw,40px) 44px}.cards{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:12px;margin-bottom:16px}.card,.panel{background:rgba(255,253,247,.92);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}.card{padding:15px}.card span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.card strong{display:block;margin-top:8px;font-size:clamp(18px,2vw,28px);line-height:1.05}.grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(360px,.8fr);gap:16px}.section{margin-top:16px}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 17px;border-bottom:1px solid var(--line)}.panel-head h2{margin:0;font-size:16px}.panel-head small{color:var(--muted)}.chart{height:360px;padding:14px}.chart.short{height:280px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.toggle{background:#fff;color:var(--accent);border-color:var(--accent)}
+    table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}th{background:rgba(244,247,240,.78);color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}.scroll{overflow:auto}.good{color:var(--good);font-weight:800}.bad{color:var(--bad);font-weight:800}.flat{color:var(--muted);font-weight:700}.heat{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:14px}.heat div{border:1px solid var(--line);border-radius:13px;padding:12px;background:#fff}.heat b{display:block}.heat span{font-size:24px;font-weight:850}.note{color:var(--muted);padding:14px 17px;line-height:1.55}.error{padding:18px;color:var(--bad);font-weight:800}.risk-grid{display:grid;grid-template-columns:minmax(210px,.46fr) minmax(0,1fr);gap:18px;padding:18px}.risk-score{display:flex;flex-direction:column;justify-content:center;border-radius:14px;padding:18px;color:#fff}.risk-score strong{font-size:48px;line-height:1}.risk-score span{font-weight:800;letter-spacing:.08em}.risk-LOW{background:#117e71}.risk-WATCH{background:#c38b12}.risk-HIGH{background:#df7924}.risk-CRITICAL{background:#c5463d}.risk-parts{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px}.risk-parts div{background:#f4f7f0;border-radius:9px;padding:9px;text-align:center}.risk-parts small{display:block;color:var(--muted)}.risk-reasons{margin:0;padding-left:20px;line-height:1.7}
+    @media(max-width:1100px){.cards{grid-template-columns:repeat(3,1fr)}.grid,.split,.risk-grid{grid-template-columns:1fr}}@media(max-width:640px){header{position:static}.cards{grid-template-columns:1fr}.controls,select,button{width:100%}.chart{height:300px}.heat{grid-template-columns:1fr}.risk-parts{grid-template-columns:repeat(2,1fr)}}
   </style>
 </head>
 <body>
 <header><div class="bar"><div><div class="eyebrow">Local Dashboard · Auto refresh 60s</div><h1>Market Structure</h1><div class="sub" id="subtitle">Loading...</div></div><div class="controls"><select id="symbolSelect"></select><button id="oiToggle" class="toggle">Raw OI USDT</button><button id="refreshButton">Refresh</button></div></div></header>
 <main>
   <section class="cards">
-    <div class="card"><span>Selected Symbol</span><strong id="cSymbol">-</strong></div><div class="card"><span>Total OI USDT</span><strong id="cOi">-</strong></div><div class="card"><span>Total OI Change</span><strong id="cOiChg">-</strong></div><div class="card"><span>Total 30m Volume</span><strong id="cVol">-</strong></div><div class="card"><span>Volume Change</span><strong id="cVolChg">-</strong></div><div class="card"><span>Avg Long / Taker</span><strong id="cBias">-</strong></div>
+    <div class="card"><span>Selected Symbol</span><strong id="cSymbol">-</strong></div><div class="card"><span>Highest Risk</span><strong id="cRisk">N/A</strong></div><div class="card"><span>Total OI USDT</span><strong id="cOi">-</strong></div><div class="card"><span>Total OI Change</span><strong id="cOiChg">-</strong></div><div class="card"><span>Total 30m Volume</span><strong id="cVol">-</strong></div><div class="card"><span>Volume Change</span><strong id="cVolChg">-</strong></div><div class="card"><span>Avg Long / Taker</span><strong id="cBias">-</strong></div>
   </section>
+  <section class="panel section"><div class="panel-head"><h2>Position Risk Score</h2><small>Monitoring aid only; no automated trading action</small></div><div id="riskMount"></div></section>
   <section class="grid">
     <div>
       <div class="panel"><div class="panel-head"><h2>Exchange OI Trend</h2><small id="oiMode">Raw OI USDT</small></div><div class="chart"><canvas id="oiChart"></canvas></div></div>
@@ -348,7 +422,8 @@ function chart(id, type, data, yTitle){if(charts[id])charts[id].destroy(); chart
 function renderCharts(d){const oiSeries=oiNormalized?d.series.exchangeOiNormalized:d.series.exchangeOiRaw; document.getElementById("oiMode").textContent=oiNormalized?"Normalized OI (first sample = 100)":"Raw OI USDT"; document.getElementById("oiToggle").textContent=oiNormalized?"Normalized OI":"Raw OI USDT"; chart("oiChart","line",{datasets:datasets(oiSeries)},oiNormalized?"Normalized OI":"OI USDT"); chart("volumeChart","line",{datasets:datasets(d.series.exchangeVolume)},"30m Volume USDT"); chart("aggChart","line",{datasets:[{label:"Aggregated OI USDT",data:d.series.aggregated.map(p=>({x:p.x,y:p.oi})),borderColor:colors[0],backgroundColor:colors[0],borderWidth:2,pointRadius:0,tension:.25},{label:"Aggregated Volume USDT",data:d.series.aggregated.map(p=>({x:p.x,y:p.volume})),borderColor:colors[3],backgroundColor:colors[3],borderWidth:2,pointRadius:0,tension:.25}]},"USDT"); chart("lsChart","line",{datasets:[...datasets(d.series.longRatio),...datasets(d.series.shortRatio).map(x=>({...x,borderDash:[5,4]}))]},"Ratio"); chart("takerChart","line",{datasets:[...datasets(d.series.takerBuy),...datasets(d.series.takerSell).map(x=>({...x,borderDash:[5,4]}))]},"USDT"); const smart=d.smartSignal; document.getElementById("smartNote").textContent=smart.samples.length?smart.note:"Smart Signal data is not available or disabled. "+smart.note; chart("smartChart","line",{datasets:[{label:"Avg Entry Price",data:smart.avgEntryPrice,borderColor:colors[0],backgroundColor:colors[0],pointRadius:0},{label:"Unrealized PnL USDT",data:smart.unrealizedPnl,borderColor:colors[1],backgroundColor:colors[1],pointRadius:0},{label:"Unrealized PnL % / ROI",data:smart.unrealizedPnlPct,borderColor:colors[2],backgroundColor:colors[2],pointRadius:0}]},"Value");}
 function renderTable(rows){document.getElementById("table").innerHTML=`<table><thead><tr><th>Exchange</th><th>OI USDT</th><th>OI raw</th><th>OI Chg</th><th>30m Vol USDT</th><th>Vol raw</th><th>Spike</th><th>Long</th><th>Short</th><th>Taker Buy</th><th>Taker Sell</th><th>Updated</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${r.exchange}</td><td>${r.oiUsdtText}</td><td>${fmt(r.oiRaw)} ${r.oiRawUnit||""}</td><td class="${cls(r.oiChangePct)}">${pct(r.oiChangePct)}</td><td>${r.volume30mUsdtText}</td><td>${fmt(r.volumeRaw)} ${r.volumeRawUnit||""}</td><td>${r.volumeSpike==null?"N/A":r.volumeSpike.toFixed(2)+"x"}</td><td>${ratio(r.longRatio)}</td><td>${ratio(r.shortRatio)}</td><td>${compact(r.takerBuyUsdt)}</td><td>${compact(r.takerSellUsdt)}</td><td>${r.lastUpdatedJst}</td></tr>`).join("")}</tbody></table>`;}
 function renderHeat(rows){document.getElementById("heat").innerHTML=rows.map(r=>`<div><b>${r.exchange}</b><span class="${cls(r.oiChangePct)}">${pct(r.oiChangePct)}</span></div>`).join("")||`<div>No data</div>`;}
-async function load(symbol){const qs=symbol?`?symbol=${encodeURIComponent(symbol)}&ts=${Date.now()}`:`?ts=${Date.now()}`; const d=await (await fetch(`/api/snapshot${qs}`,{cache:"no-store"})).json(); currentData=d; const sel=document.getElementById("symbolSelect"); sel.innerHTML=d.symbols.map(s=>`<option value="${s}">${s}</option>`).join(""); if(d.selectedSymbol)sel.value=d.selectedSymbol; if(d.error){document.getElementById("subtitle").textContent=d.error; return;} document.getElementById("subtitle").textContent=`${d.selectedSymbol} · latest ${d.latestSampleAt||"N/A"} JST · generated ${d.generatedAt} JST`; const c=d.summaryCards; document.getElementById("cSymbol").textContent=d.selectedSymbol; document.getElementById("cOi").textContent=c.totalOiUsdtText; document.getElementById("cOiChg").textContent=pct(c.totalOiChangePct); document.getElementById("cOiChg").className=cls(c.totalOiChangePct); document.getElementById("cVol").textContent=c.totalVolume30mUsdtText; document.getElementById("cVolChg").textContent=pct(c.totalVolumeChangePct); document.getElementById("cVolChg").className=cls(c.totalVolumeChangePct); document.getElementById("cBias").textContent=`${ratio(c.averageLongRatio)} / ${fmt(c.averageTakerBuySellRatio)}`; renderCharts(d); renderTable(d.latestTable); renderHeat(d.latestTable);}
+function renderRisk(data){const rows=data.selected||[]; if(!rows.length){document.getElementById("riskMount").innerHTML=`<div class="note">Risk score data is not available yet. It will appear after the next notifier cycle.</div>`; return;} const detail=rows.map(r=>`<div class="risk-grid"><div class="risk-score risk-${r.level}"><span>${r.level}</span><strong>${r.score}</strong><small>/ 100 · ${r.symbol} ${r.side}</small></div><div><div class="risk-parts"><div><small>PnL</small>${r.pnlScore}</div><div><small>Crowding</small>${r.crowdingScore}</div><div><small>OI</small>${r.oiScore}</div><div><small>Volume</small>${r.volumeScore}</div><div><small>Taker</small>${r.takerScore}</div><div><small>Dispersion</small>${r.dispersionScore}</div></div><ul class="risk-reasons">${r.reasons.map(reason=>`<li>${reason}</li>`).join("")}</ul></div></div>`).join(""); const overview=`<div class="scroll"><table><thead><tr><th>Held Position</th><th>Side</th><th>Level</th><th>Score</th><th>Observed JST</th></tr></thead><tbody>${data.latestBySymbol.map(r=>`<tr><td>${r.symbol}</td><td>${r.side}</td><td class="${r.level==="LOW"?"good":r.level==="WATCH"?"flat":"bad"}">${r.level}</td><td>${r.score}/100</td><td>${r.observedAt}</td></tr>`).join("")}</tbody></table></div>`; document.getElementById("riskMount").innerHTML=detail+overview;}
+async function load(symbol){const qs=symbol?`?symbol=${encodeURIComponent(symbol)}&ts=${Date.now()}`:`?ts=${Date.now()}`; const d=await (await fetch(`/api/snapshot${qs}`,{cache:"no-store"})).json(); currentData=d; const sel=document.getElementById("symbolSelect"); sel.innerHTML=d.symbols.map(s=>`<option value="${s}">${s}</option>`).join(""); if(d.selectedSymbol)sel.value=d.selectedSymbol; if(d.error){document.getElementById("subtitle").textContent=d.error; return;} document.getElementById("subtitle").textContent=`${d.selectedSymbol} · latest ${d.latestSampleAt||"N/A"} JST · generated ${d.generatedAt} JST`; const c=d.summaryCards; const risk=d.riskScores.highest; document.getElementById("cSymbol").textContent=d.selectedSymbol; document.getElementById("cRisk").textContent=risk?`${risk.level} ${risk.score}`:"N/A"; document.getElementById("cRisk").className=risk&&risk.level==="CRITICAL"?"bad":risk&&risk.level==="HIGH"?"bad":risk&&risk.level==="LOW"?"good":"flat"; document.getElementById("cOi").textContent=c.totalOiUsdtText; document.getElementById("cOiChg").textContent=pct(c.totalOiChangePct); document.getElementById("cOiChg").className=cls(c.totalOiChangePct); document.getElementById("cVol").textContent=c.totalVolume30mUsdtText; document.getElementById("cVolChg").textContent=pct(c.totalVolumeChangePct); document.getElementById("cVolChg").className=cls(c.totalVolumeChangePct); document.getElementById("cBias").textContent=`${ratio(c.averageLongRatio)} / ${fmt(c.averageTakerBuySellRatio)}`; renderRisk(d.riskScores); renderCharts(d); renderTable(d.latestTable); renderHeat(d.latestTable);}
 document.getElementById("symbolSelect").addEventListener("change",e=>load(e.target.value)); document.getElementById("refreshButton").addEventListener("click",()=>load(document.getElementById("symbolSelect").value)); document.getElementById("oiToggle").addEventListener("click",()=>{oiNormalized=!oiNormalized;if(currentData)renderCharts(currentData);}); load(); setInterval(()=>load(document.getElementById("symbolSelect").value),60000);
 </script>
 </body></html>"""

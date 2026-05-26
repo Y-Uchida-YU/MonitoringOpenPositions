@@ -27,6 +27,7 @@ bitget_position_notifier/
   discord_notifier.py
   config.py
   market_metrics.py
+  risk_score.py
   smart_signal.py
   requirements.txt
   .env.example
@@ -79,6 +80,7 @@ DISCORD_USERNAME=Bitget Position Bot
 ENABLE_MARKET_METRICS=true
 MARKET_DATA_EXCHANGES=binance,bybit,bitget,okx,gate,hyperliquid
 MARKET_METRICS_DB_PATH=data/market_metrics.sqlite3
+ENABLE_RISK_SCORE=true
 
 ENABLE_BINANCE_SMART_SIGNAL=false
 BINANCE_SMART_SIGNAL_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT
@@ -137,6 +139,7 @@ It shows:
 - Binance Smart Money / Smart Signal section when enabled and data exists
 - Latest Exchange Table with USDT values first and raw values as supporting context
 - OI change heatmap for quick visual strength/weakness checks
+- Position Risk Score panel with the selected position's score breakdown and explanatory risk reasons
 
 ### Dashboard v2 and USDT Normalization
 
@@ -165,7 +168,7 @@ The database is stored at:
 bitget_position_notifier/data/market_metrics.sqlite3
 ```
 
-Older SQLite databases are migrated on startup without deleting existing rows.
+Older SQLite schemas are migrated on startup without a destructive table rebuild. During normal monitoring, historical rows for symbols no longer held are deleted by design.
 
 ### Indicator Notes
 
@@ -176,6 +179,28 @@ Long/Short Volume is also not standardized. Where direct long/short volume is un
 Binance Smart Money / Smart Signal is disabled by default. This project does not scrape protected, login-gated, bot-protected, or CAPTCHA-protected Binance pages. If no stable public API is available, the dashboard shows `Smart Signal data is not available or disabled.`
 
 The dashboard is independent of the Bitget position notification loop. `python main.py` can run the notifier, and `python dashboard.py` can be started separately for local analysis.
+
+### Position Risk Score
+
+The notifier calculates a `0` to `100` Position Risk Score for each currently held position and shows it in Discord and the dashboard:
+
+- `LOW` (`0-24`): routine monitoring
+- `WATCH` (`25-49`): mild caution
+- `HIGH` (`50-74`): increased risk requiring review
+- `CRITICAL` (`75-100`): highly elevated market and position risk
+
+The score combines six explainable inputs:
+
+- Leveraged unrealized price-move PnL risk
+- Crowding risk based on long/short account ratios and position direction
+- OI expansion risk
+- Volume spike risk
+- Taker buy/sell imbalance risk
+- Cross-exchange OI dispersion risk
+
+Risk scores and their reasons are stored in the SQLite `risk_scores` table. They are automatically removed for symbols that are no longer held.
+
+Risk Score is a monitoring aid only. It is not trading advice, and this bot never automatically closes, reduces, profits, stops, or opens a position.
 
 ## Discord Notification Content
 
@@ -188,6 +213,8 @@ Each run includes:
 - Mark price
 - Unrealized PnL (signed + / -)
 - Leverage
+- Position Risk Score and risk level (`LOW`, `WATCH`, `HIGH`, `CRITICAL`)
+- Up to five explanatory risk reasons
 - Major OI change from public exchange data
 - 30m volume spike versus recent 30m average
 - Long/Short account ratio where public data is available

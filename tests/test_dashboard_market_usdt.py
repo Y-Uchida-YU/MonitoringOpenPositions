@@ -11,8 +11,9 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from dashboard import read_snapshot
-from main import held_positions_from
-from market_metrics import ExchangeMetric, MarketMetricStore, convert_to_usdt, normalize_symbol
+from main import build_position_embeds, held_positions_from
+from market_metrics import ExchangeMetric, MarketMetricStore, SymbolMarketMetrics, convert_to_usdt, normalize_symbol
+from risk_score import RiskScoreStore, calculate_position_pnl_pct, calculate_position_risk, risk_level_from_score
 from smart_signal import SmartSignalSample, SmartSignalStore
 
 
@@ -216,3 +217,114 @@ def test_previous_oi_prefers_market_usdt_then_market_value_then_legacy_oi(tmp_pa
     with sqlite3.connect(db_path) as conn:
         conn.execute("DELETE FROM market_samples WHERE symbol = 'BTCUSDT'")
     assert store.previous_oi_usdt("Binance", "BTCUSDT", 1_200) == Decimal("1")
+
+
+def metrics_for_risk(
+    *,
+    long_ratio: str = "0.72",
+    oi_change: str = "16",
+    volume_spike: str = "3.1",
+    taker_ratio: str = "2.1",
+) -> SymbolMarketMetrics:
+    return SymbolMarketMetrics(
+        symbol="BTCUSDT",
+        exchange_metrics=[
+            ExchangeMetric(
+                exchange="Binance",
+                long_ratio=Decimal(long_ratio),
+                oi_change_pct=Decimal(oi_change),
+                volume_spike=Decimal(volume_spike),
+                taker_buy_sell_ratio=Decimal(taker_ratio),
+            ),
+            ExchangeMetric(exchange="Bybit", oi_change_pct=Decimal("-5"), long_ratio=Decimal(long_ratio)),
+        ],
+    )
+
+
+def test_risk_pnl_supports_long_short_leverage_and_missing_entry() -> None:
+    assert calculate_position_pnl_pct({"holdSide": "long", "openPriceAvg": "100", "markPrice": "102", "leverage": "10"}) == Decimal("20.0")
+    assert calculate_position_pnl_pct({"holdSide": "short", "openPriceAvg": "100", "markPrice": "98", "leverage": "10"}) == Decimal("20.0")
+    assert calculate_position_pnl_pct({"holdSide": "long", "openPriceAvg": "0", "markPrice": "98", "leverage": "10"}) is None
+    assert calculate_position_risk({"symbol": "BTCUSDT", "holdSide": "long"}, None).pnl_score == 12
+
+
+def test_risk_levels_boundaries() -> None:
+    assert risk_level_from_score(0) == "LOW"
+    assert risk_level_from_score(24) == "LOW"
+    assert risk_level_from_score(25) == "WATCH"
+    assert risk_level_from_score(49) == "WATCH"
+    assert risk_level_from_score(50) == "HIGH"
+    assert risk_level_from_score(74) == "HIGH"
+    assert risk_level_from_score(75) == "CRITICAL"
+    assert risk_level_from_score(100) == "CRITICAL"
+
+
+def test_risk_scores_crowding_oi_volume_and_taker_risk() -> None:
+    long_result = calculate_position_risk(
+        {"symbol": "BTCUSDT", "holdSide": "long", "openPriceAvg": "100", "markPrice": "80", "leverage": "2"},
+        metrics_for_risk(),
+    )
+    short_result = calculate_position_risk(
+        {"symbol": "BTCUSDT", "holdSide": "short", "openPriceAvg": "100", "markPrice": "100", "leverage": "1"},
+        metrics_for_risk(long_ratio="0.25", taker_ratio="0.4"),
+    )
+    assert long_result.crowding_score == 25
+    assert long_result.oi_score >= 12
+    assert long_result.volume_score == 15
+    assert long_result.taker_score == 10
+    assert long_result.score >= 75
+    assert short_result.crowding_score == 25
+    assert short_result.taker_score == 10
+
+
+def test_discord_embed_shows_risk_and_uses_highest_risk_color() -> None:
+    position = {"symbol": "BTCUSDT", "holdSide": "long", "openPriceAvg": "100", "markPrice": "80", "leverage": "2"}
+    result = calculate_position_risk(position, metrics_for_risk())
+    embeds = build_position_embeds(
+        [position],
+        product_type="USDT-FUTURES",
+        risk_scores_by_position={("BTCUSDT", "long"): result},
+    )
+    position_text = embeds[0]["fields"][2]["value"]
+    assert f"`{result.level} {result.score}/100`" in position_text
+    assert "Reasons" in position_text
+    assert embeds[0]["color"] == 0xE74C3C
+
+
+def test_risk_scores_insert_prune_and_dashboard_json(tmp_path: Path) -> None:
+    db_path = tmp_path / "risk.sqlite3"
+    market_store = MarketMetricStore(db_path)
+    market_store.save_market_sample("BTCUSDT", 1_800, ExchangeMetric(exchange="Binance", oi_value=Decimal("10")))
+    market_store.save_market_sample("ETHUSDT", 1_800, ExchangeMetric(exchange="Binance", oi_value=Decimal("20")))
+    risk_store = RiskScoreStore(db_path)
+    btc_result = calculate_position_risk({"symbol": "BTCUSDT", "holdSide": "long"}, None)
+    eth_result = calculate_position_risk({"symbol": "ETHUSDT", "holdSide": "short"}, None)
+    risk_store.save(1_800, btc_result)
+    risk_store.save(1_800, eth_result)
+
+    snapshot = read_snapshot(db_path, symbol="BTCUSDT")
+    assert snapshot["riskScores"]["selected"][0]["symbol"] == "BTCUSDT"
+    assert snapshot["riskScores"]["selected"][0]["score"] == btc_result.score
+
+    market_store.prune_symbols_not_in({"BTCUSDT"})
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT DISTINCT symbol FROM risk_scores").fetchall() == [("BTCUSDT",)]
+
+
+def test_dashboard_without_risk_score_table_is_safe(tmp_path: Path) -> None:
+    db_path = tmp_path / "no-risk.sqlite3"
+    store = MarketMetricStore(db_path)
+    store.save_market_sample("SOLUSDT", 1_800, ExchangeMetric(exchange="Binance", oi_value=Decimal("10")))
+    snapshot = read_snapshot(db_path, symbol="SOLUSDT")
+    assert snapshot["riskScores"]["selected"] == []
+    assert snapshot["riskScores"]["highest"] is None
+
+
+def test_dashboard_can_show_risk_when_market_metrics_are_disabled(tmp_path: Path) -> None:
+    db_path = tmp_path / "risk-only.sqlite3"
+    risk_store = RiskScoreStore(db_path)
+    result = calculate_position_risk({"symbol": "HYPEUSDT", "holdSide": "long"}, None)
+    risk_store.save(1_800, result)
+    snapshot = read_snapshot(db_path)
+    assert snapshot["symbols"] == ["HYPEUSDT"]
+    assert snapshot["riskScores"]["selected"][0]["symbol"] == "HYPEUSDT"
