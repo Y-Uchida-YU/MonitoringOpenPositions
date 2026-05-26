@@ -293,8 +293,8 @@ class MarketMetricStore:
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'smart_signal_samples'"
             ).fetchone()
             if not smart_signal_exists:
-                return
-            if normalized_symbols:
+                pass
+            elif normalized_symbols:
                 normalized_placeholders = ",".join("?" for _ in normalized_symbols)
                 conn.execute(
                     f"DELETE FROM smart_signal_samples WHERE normalized_symbol NOT IN ({normalized_placeholders})",
@@ -302,6 +302,18 @@ class MarketMetricStore:
                 )
             else:
                 conn.execute("DELETE FROM smart_signal_samples")
+
+            risk_scores_exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'risk_scores'"
+            ).fetchone()
+            if risk_scores_exists and normalized_symbols:
+                normalized_placeholders = ",".join("?" for _ in normalized_symbols)
+                conn.execute(
+                    f"DELETE FROM risk_scores WHERE normalized_symbol NOT IN ({normalized_placeholders})",
+                    tuple(sorted(normalized_symbols)),
+                )
+            elif risk_scores_exists:
+                conn.execute("DELETE FROM risk_scores")
 
     def previous_oi_usdt(self, exchange: str, symbol: str, before_at: int) -> Decimal | None:
         with self._connect() as conn:

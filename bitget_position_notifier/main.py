@@ -12,6 +12,7 @@ from bitget_client import BitgetApiError, BitgetClient
 from config import load_config
 from discord_notifier import DiscordNotifier, DiscordNotifierError
 from market_metrics import MarketMetricService, MarketMetricStore, SymbolMarketMetrics
+from risk_score import RiskScoreResult, RiskScoreStore, calculate_position_risk
 
 JST = ZoneInfo("Asia/Tokyo")
 MAX_FIELDS_PER_EMBED = 25
@@ -191,9 +192,21 @@ def format_market_metrics(metrics: SymbolMarketMetrics | None) -> list[str]:
     ]
 
 
+def format_risk_score(result: RiskScoreResult | None) -> list[str]:
+    if result is None:
+        return []
+    reasons = "\n".join(f"- {reason}" for reason in result.reasons[:5])
+    return [
+        f"**Risk**  `{result.level} {result.score}/100`",
+        f"`Breakdown` PnL {result.pnl_score} | Crowd {result.crowding_score} | OI {result.oi_score} | Vol {result.volume_score} | Taker {result.taker_score} | Disp {result.dispersion_score}",
+        f"**Reasons**\n{reasons}",
+    ]
+
+
 def build_position_field(
     position: dict[str, Any],
     market_metrics: SymbolMarketMetrics | None = None,
+    risk_score: RiskScoreResult | None = None,
 ) -> tuple[dict[str, Any], Decimal]:
     symbol = str(position.get("symbol") or "N/A")
     side = str(position.get("holdSide") or "N/A").lower()
@@ -206,6 +219,7 @@ def build_position_field(
         [
             f"**Position**  `{side}`  |  `{leverage}x`  |  PnL `{format_decimal(unrealized_pnl, places=4, signed=True)}`",
             f"`Entry` {entry_price}  ->  `Mark` {mark_price}",
+            *format_risk_score(risk_score),
             *format_market_metrics(market_metrics),
         ]
     )
@@ -223,6 +237,7 @@ def build_position_embeds(
     *,
     product_type: str,
     market_metrics_by_symbol: dict[str, SymbolMarketMetrics] | None = None,
+    risk_scores_by_position: dict[tuple[str, str], RiskScoreResult] | None = None,
 ) -> list[dict[str, Any]]:
     observed_at_jst = datetime.now(JST)
     observed_text = observed_at_jst.strftime("%Y-%m-%d %H:%M:%S JST")
@@ -250,6 +265,9 @@ def build_position_embeds(
         field, unrealized = build_position_field(
             position,
             market_metrics=(market_metrics_by_symbol or {}).get(symbol),
+            risk_score=(risk_scores_by_position or {}).get(
+                (symbol, str(position.get("holdSide") or "long").lower())
+            ),
         )
         fields.append(field)
         total_unrealized += unrealized
@@ -262,6 +280,9 @@ def build_position_embeds(
         for i in range(0, len(remaining_fields), MAX_FIELDS_PER_EMBED)
     ]
     chunks = [first_chunk] + remaining_chunks
+    risk_results = list((risk_scores_by_position or {}).values())
+    highest_risk = max(risk_results, key=lambda item: item.score) if risk_results else None
+    risk_colors = {"LOW": 0x2B90D9, "WATCH": 0xF1C40F, "HIGH": 0xF39C12, "CRITICAL": 0xE74C3C}
     embeds: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks, start=1):
         embed_fields = list(chunk)
@@ -290,7 +311,11 @@ def build_position_embeds(
         embeds.append(
             {
                 "title": f"{title}{title_suffix}",
-                "color": 0x00A884 if total_unrealized >= 0 else 0xE74C3C,
+                "color": (
+                    risk_colors[highest_risk.level]
+                    if highest_risk is not None
+                    else (0x00A884 if total_unrealized >= 0 else 0xE74C3C)
+                ),
                 "timestamp": discord_timestamp,
                 "fields": embed_fields,
             }
@@ -373,6 +398,8 @@ def run() -> None:
             timeout_seconds=config.request_timeout_seconds,
             db_path=market_db_path,
         )
+    market_store = market_metric_service.store if market_metric_service is not None else MarketMetricStore(market_db_path)
+    risk_store = RiskScoreStore(market_db_path) if config.enable_risk_score else None
 
     logger.info(
         "Position monitor started (product_type=%s, margin_coin=%s, aligned_interval=%s sec)",
@@ -393,19 +420,26 @@ def run() -> None:
             )
             held_positions = held_positions_from(positions)
             symbols = sorted({str(position["symbol"]) for position in held_positions})
-            if market_metric_service is not None:
-                market_metric_service.store.prune_symbols_not_in(set(symbols))
-            elif market_db_path.exists():
-                MarketMetricStore(market_db_path).prune_symbols_not_in(set(symbols))
+            market_store.prune_symbols_not_in(set(symbols))
             market_metrics_by_symbol = (
                 market_metric_service.fetch_for_symbols(symbols)
                 if market_metric_service is not None and symbols
                 else {}
             )
+            risk_scores_by_position: dict[tuple[str, str], RiskScoreResult] = {}
+            if config.enable_risk_score:
+                observed_at = int(time.time())
+                for position in held_positions:
+                    symbol = str(position["symbol"])
+                    result = calculate_position_risk(position, market_metrics_by_symbol.get(symbol))
+                    risk_scores_by_position[(symbol, result.side)] = result
+                    if risk_store is not None:
+                        risk_store.save(observed_at, result)
             embeds = build_position_embeds(
                 held_positions,
                 product_type=config.product_type,
                 market_metrics_by_symbol=market_metrics_by_symbol,
+                risk_scores_by_position=risk_scores_by_position,
             )
             send_embeds_in_batches(notifier, embeds)
             logger.info(
