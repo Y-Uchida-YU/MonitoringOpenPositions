@@ -12,7 +12,7 @@ from bitget_client import BitgetApiError, BitgetClient
 from config import load_config
 from discord_notifier import DiscordNotifier, DiscordNotifierError
 from market_metrics import MarketMetricService, MarketMetricStore, SymbolMarketMetrics
-from risk_score import RiskScoreResult, RiskScoreStore, calculate_position_risk
+from risk_score import RiskScoreResult, RiskScoreStore, calculate_position_pnl_pct, calculate_position_risk
 
 JST = ZoneInfo("Asia/Tokyo")
 MAX_FIELDS_PER_EMBED = 25
@@ -131,6 +131,22 @@ def find_exchange_metric(metrics: SymbolMarketMetrics, exchange: str) -> Any | N
             return metric
     return None
 
+
+def format_position_pnl_pct(position: dict[str, Any]) -> str:
+    pnl_pct = calculate_position_pnl_pct(position)
+    if pnl_pct is None:
+        return "N/A"
+    return f"{format_decimal(pnl_pct, places=2, signed=True)}%"
+
+
+def format_public_market_metrics(metrics: SymbolMarketMetrics | None) -> list[str]:
+    if metrics is None:
+        return []
+
+    return [
+        "**Market**",
+        *format_market_metrics(metrics),
+    ]
 
 def format_market_metrics(metrics: SymbolMarketMetrics | None) -> list[str]:
     if metrics is None:
@@ -323,6 +339,104 @@ def build_position_embeds(
 
     return embeds
 
+def build_public_position_field(
+    position: dict[str, Any],
+    market_metrics: SymbolMarketMetrics | None = None,
+    risk_score: RiskScoreResult | None = None,
+) -> dict[str, Any]:
+    symbol = str(position.get("symbol") or "N/A")
+    side = str(position.get("holdSide") or "N/A").lower()
+    leverage = str(position.get("leverage") or "N/A")
+    field_value = "\n".join(
+        [
+            f"Direction: {side}",
+            f"Entry Price: {format_optional_decimal(position.get('openPriceAvg'))}",
+            f"Mark Price: {format_optional_decimal(position.get('markPrice'))}",
+            f"PnL%: {format_position_pnl_pct(position)}",
+            f"Leverage: {leverage}x",
+            *format_risk_score(risk_score),
+            *format_public_market_metrics(market_metrics),
+        ]
+    )
+    return {"name": f"{symbol} ({side})", "value": field_value, "inline": False}
+
+
+def build_public_position_embeds(
+    positions: list[dict[str, Any]],
+    *,
+    product_type: str,
+    market_metrics_by_symbol: dict[str, SymbolMarketMetrics] | None = None,
+    risk_scores_by_position: dict[tuple[str, str], RiskScoreResult] | None = None,
+) -> list[dict[str, Any]]:
+    observed_text = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
+    discord_timestamp = datetime.now(timezone.utc).isoformat()
+    title = f"Position Monitor Public ({product_type})"
+
+    if not positions:
+        return [
+            {
+                "title": title,
+                "description": "Current positions: none",
+                "color": 0x2B90D9,
+                "timestamp": discord_timestamp,
+                "fields": [{"name": "Notified At (JST)", "value": observed_text, "inline": False}],
+            }
+        ]
+
+    fields = [
+        build_public_position_field(
+            position,
+            market_metrics=(market_metrics_by_symbol or {}).get(str(position.get("symbol") or "N/A")),
+            risk_score=(risk_scores_by_position or {}).get(
+                (str(position.get("symbol") or "N/A"), str(position.get("holdSide") or "long").lower())
+            ),
+        )
+        for position in positions
+    ]
+    first_chunk_limit = MAX_FIELDS_PER_EMBED - 2
+    first_chunk = fields[:first_chunk_limit]
+    remaining_fields = fields[first_chunk_limit:]
+    remaining_chunks = [
+        remaining_fields[i : i + MAX_FIELDS_PER_EMBED]
+        for i in range(0, len(remaining_fields), MAX_FIELDS_PER_EMBED)
+    ]
+    chunks = [first_chunk] + remaining_chunks
+    risk_results = list((risk_scores_by_position or {}).values())
+    highest_risk = max(risk_results, key=lambda item: item.score) if risk_results else None
+    risk_colors = {"LOW": 0x2B90D9, "WATCH": 0xF1C40F, "HIGH": 0xF39C12, "CRITICAL": 0xE74C3C}
+    embeds: list[dict[str, Any]] = []
+
+    for index, chunk in enumerate(chunks, start=1):
+        embed_fields = list(chunk)
+        if index == 1:
+            embed_fields.insert(
+                0,
+                {
+                    "name": "Summary",
+                    "value": f"`JST` {observed_text}\n`Privacy` Personal realized/unrealized PnL amounts and total PnL are hidden.",
+                    "inline": False,
+                },
+            )
+            embed_fields.insert(
+                1,
+                {
+                    "name": "Legend",
+                    "value": "`BN` Binance | `BB` Bybit | `BG` Bitget | `GT` Gate | `HL` Hyperliquid",
+                    "inline": False,
+                },
+            )
+
+        title_suffix = f" [{index}/{len(chunks)}]" if len(chunks) > 1 else ""
+        embeds.append(
+            {
+                "title": f"{title}{title_suffix}",
+                "color": risk_colors[highest_risk.level] if highest_risk is not None else 0x2B90D9,
+                "timestamp": discord_timestamp,
+                "fields": embed_fields,
+            }
+        )
+
+    return embeds
 
 def build_error_embed(error: Exception) -> dict[str, Any]:
     observed_at_jst = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
@@ -390,6 +504,15 @@ def run() -> None:
         timeout_seconds=config.request_timeout_seconds,
         username=config.discord_username,
     )
+    public_notifier = (
+        DiscordNotifier(
+            webhook_url=config.discord_webhook_url_public,
+            timeout_seconds=config.request_timeout_seconds,
+            username=f"{config.discord_username} Public",
+        )
+        if config.discord_webhook_url_public
+        else None
+    )
     market_metric_service = None
     market_db_path = app_dir / config.market_metrics_db_path
     if config.enable_market_metrics:
@@ -441,9 +564,27 @@ def run() -> None:
                 market_metrics_by_symbol=market_metrics_by_symbol,
                 risk_scores_by_position=risk_scores_by_position,
             )
-            send_embeds_in_batches(notifier, embeds)
+            try:
+                send_embeds_in_batches(notifier, embeds)
+                logger.info("Private position notification sent successfully")
+            except DiscordNotifierError as exc:
+                logger.exception("Private Discord webhook error: %s", exc)
+
+            if public_notifier is not None:
+                public_embeds = build_public_position_embeds(
+                    held_positions,
+                    product_type=config.product_type,
+                    market_metrics_by_symbol=market_metrics_by_symbol,
+                    risk_scores_by_position=risk_scores_by_position,
+                )
+                try:
+                    send_embeds_in_batches(public_notifier, public_embeds)
+                    logger.info("Public position notification sent successfully")
+                except DiscordNotifierError as exc:
+                    logger.exception("Public Discord webhook error: %s", exc)
+
             logger.info(
-                "Position notification sent successfully (positions=%d, held_symbols=%s)",
+                "Position notification cycle finished (positions=%d, held_symbols=%s)",
                 len(held_positions),
                 ",".join(symbols) or "none",
             )

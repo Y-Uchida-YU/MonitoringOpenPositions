@@ -12,6 +12,7 @@ class Config:
     bitget_api_secret: str
     bitget_passphrase: str
     discord_webhook_url: str
+    discord_webhook_url_public: str | None = None
     base_url: str = "https://api.bitget.com"
     product_type: str = "USDT-FUTURES"
     margin_coin: str = "USDT"
@@ -34,6 +35,11 @@ def _require_env(name: str) -> str:
     return value.strip()
 
 
+def _optional_env(name: str) -> str | None:
+    value = os.getenv(name)
+    return value.strip() if value is not None and value.strip() else None
+
+
 def load_config() -> Config:
     load_dotenv()
 
@@ -53,12 +59,14 @@ def load_config() -> Config:
         ).split(",")
         if exchange.strip()
     )
+    private_webhook_url = _optional_env("DISCORD_WEBHOOK_URL_PRIVATE") or _require_env("DISCORD_WEBHOOK_URL")
 
     return Config(
         bitget_api_key=_require_env("BITGET_API_KEY"),
         bitget_api_secret=_require_env("BITGET_API_SECRET"),
         bitget_passphrase=_require_env("BITGET_PASSPHRASE"),
-        discord_webhook_url=_require_env("DISCORD_WEBHOOK_URL"),
+        discord_webhook_url=private_webhook_url,
+        discord_webhook_url_public=_optional_env("DISCORD_WEBHOOK_URL_PUBLIC"),
         base_url=os.getenv("BITGET_BASE_URL", "https://api.bitget.com").rstrip("/"),
         product_type=os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES").strip(),
         margin_coin=os.getenv("BITGET_MARGIN_COIN", "USDT").strip(),

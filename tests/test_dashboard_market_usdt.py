@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import sqlite3
@@ -11,7 +11,7 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from dashboard import read_snapshot
-from main import build_position_embeds, held_positions_from
+from main import build_position_embeds, build_public_position_embeds, held_positions_from
 from market_metrics import ExchangeMetric, MarketMetricStore, SymbolMarketMetrics, convert_to_usdt, normalize_symbol
 from risk_score import RiskScoreStore, calculate_position_pnl_pct, calculate_position_risk, risk_level_from_score
 from smart_signal import SmartSignalSample, SmartSignalStore
@@ -328,3 +328,32 @@ def test_dashboard_can_show_risk_when_market_metrics_are_disabled(tmp_path: Path
     snapshot = read_snapshot(db_path)
     assert snapshot["symbols"] == ["HYPEUSDT"]
     assert snapshot["riskScores"]["selected"][0]["symbol"] == "HYPEUSDT"
+
+def test_public_discord_embed_hides_private_profit_amounts() -> None:
+    position = {
+        "symbol": "BTCUSDT",
+        "holdSide": "long",
+        "openPriceAvg": "100",
+        "markPrice": "80",
+        "leverage": "2",
+        "unrealizedPL": "-1234.56",
+    }
+    result = calculate_position_risk(position, metrics_for_risk())
+    embeds = build_public_position_embeds(
+        [position],
+        product_type="USDT-FUTURES",
+        market_metrics_by_symbol={"BTCUSDT": metrics_for_risk()},
+        risk_scores_by_position={("BTCUSDT", "long"): result},
+    )
+    text = "\n".join(field["value"] for field in embeds[0]["fields"])
+    assert "BTCUSDT (long)" == embeds[0]["fields"][2]["name"]
+    assert "PnL%" in text
+    assert "-40%" in text
+    assert "Entry Price" in text
+    assert "Mark Price" in text
+    assert "Risk" in text
+    assert "`OI`" in text
+    assert "`Vol`" in text
+    assert "2.1" in text or "2.10" in text
+    assert "1234.56" not in text
+    assert "Total Unrealized PnL" not in text

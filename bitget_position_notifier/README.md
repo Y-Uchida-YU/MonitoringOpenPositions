@@ -68,6 +68,10 @@ BITGET_API_KEY=your_bitget_api_key
 BITGET_API_SECRET=your_bitget_api_secret
 BITGET_PASSPHRASE=your_bitget_passphrase
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/xxx/yyy
+# Optional split notifications:
+# DISCORD_WEBHOOK_URL is used as the private fallback.
+DISCORD_WEBHOOK_URL_PRIVATE=
+DISCORD_WEBHOOK_URL_PUBLIC=
 
 BITGET_BASE_URL=https://api.bitget.com
 BITGET_PRODUCT_TYPE=USDT-FUTURES
@@ -204,7 +208,18 @@ Risk Score is a monitoring aid only. It is not trading advice, and this bot neve
 
 ## Discord Notification Content
 
-Each run includes:
+By default, `DISCORD_WEBHOOK_URL` receives the private notification.
+
+If you want to send both private and public notifications from one bot, set:
+
+- `DISCORD_WEBHOOK_URL_PRIVATE`: private webhook with full position details
+- `DISCORD_WEBHOOK_URL_PUBLIC`: public webhook with personal profit amounts hidden
+
+`DISCORD_WEBHOOK_URL` remains supported as the private fallback for backward compatibility.
+
+### Private Notification
+
+Each private run includes:
 
 - Notification time (JST)
 - Symbol
@@ -222,6 +237,27 @@ Each run includes:
 - Binance top trader account/position long ratio
 - Exchange OI breakdown
 - Total unrealized PnL across all positions
+
+### Public Notification
+
+The public webhook is designed for sharing held-position monitoring without revealing concrete personal profit amounts.
+
+It can show:
+
+- Symbol
+- Direction (`long` / `short`)
+- Average entry price
+- Mark price
+- PnL percentage
+- Leverage
+- Position Risk Score and risk reasons
+- Market metrics such as OI change, 30m volume, Long/Short ratio, and taker buy/sell ratio
+
+It hides:
+
+- Personal unrealized PnL amount
+- Personal realized PnL amount
+- Total unrealized PnL amount
 
 Market metrics use public market-data endpoints only. Binance, Bybit, OKX, Gate, and Hyperliquid do not require API keys. Bitget market metrics also use public market endpoints; your existing Bitget private API key remains used only for reading your own positions.
 
