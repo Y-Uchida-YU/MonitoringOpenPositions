@@ -139,15 +139,6 @@ def format_position_pnl_pct(position: dict[str, Any]) -> str:
     return f"{format_decimal(pnl_pct, places=2, signed=True)}%"
 
 
-def format_public_market_metrics(metrics: SymbolMarketMetrics | None) -> list[str]:
-    if metrics is None:
-        return []
-
-    return [
-        "**Market**",
-        *format_market_metrics(metrics),
-    ]
-
 def format_market_metrics(metrics: SymbolMarketMetrics | None) -> list[str]:
     if metrics is None:
         return []
@@ -216,6 +207,15 @@ def format_risk_score(result: RiskScoreResult | None) -> list[str]:
         f"**Risk**  `{result.level} {result.score}/100`",
         f"`Breakdown` PnL {result.pnl_score} | Crowd {result.crowding_score} | OI {result.oi_score} | Vol {result.volume_score} | Taker {result.taker_score} | Disp {result.dispersion_score}",
         f"**Reasons**\n{reasons}",
+    ]
+
+
+def format_public_risk_score(result: RiskScoreResult | None) -> list[str]:
+    if result is None:
+        return []
+    return [
+        f"Risk: {result.level} {result.score}/100",
+        f"Breakdown: PnL {result.pnl_score} | Crowd {result.crowding_score} | OI {result.oi_score} | Vol {result.volume_score} | Taker {result.taker_score} | Disp {result.dispersion_score}",
     ]
 
 
@@ -341,7 +341,6 @@ def build_position_embeds(
 
 def build_public_position_field(
     position: dict[str, Any],
-    market_metrics: SymbolMarketMetrics | None = None,
     risk_score: RiskScoreResult | None = None,
 ) -> dict[str, Any]:
     symbol = str(position.get("symbol") or "N/A")
@@ -354,8 +353,7 @@ def build_public_position_field(
             f"Mark Price: {format_optional_decimal(position.get('markPrice'))}",
             f"PnL%: {format_position_pnl_pct(position)}",
             f"Leverage: {leverage}x",
-            *format_risk_score(risk_score),
-            *format_public_market_metrics(market_metrics),
+            *format_public_risk_score(risk_score),
         ]
     )
     return {"name": f"{symbol} ({side})", "value": field_value, "inline": False}
@@ -368,9 +366,9 @@ def build_public_position_embeds(
     market_metrics_by_symbol: dict[str, SymbolMarketMetrics] | None = None,
     risk_scores_by_position: dict[tuple[str, str], RiskScoreResult] | None = None,
 ) -> list[dict[str, Any]]:
-    observed_text = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
+    observed_text = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
     discord_timestamp = datetime.now(timezone.utc).isoformat()
-    title = f"Position Monitor Public ({product_type})"
+    title = f"Position Monitor Public - {observed_text} ({product_type})"
 
     if not positions:
         return [
@@ -379,21 +377,20 @@ def build_public_position_embeds(
                 "description": "Current positions: none",
                 "color": 0x2B90D9,
                 "timestamp": discord_timestamp,
-                "fields": [{"name": "Notified At (JST)", "value": observed_text, "inline": False}],
+                "fields": [],
             }
         ]
 
     fields = [
         build_public_position_field(
             position,
-            market_metrics=(market_metrics_by_symbol or {}).get(str(position.get("symbol") or "N/A")),
             risk_score=(risk_scores_by_position or {}).get(
                 (str(position.get("symbol") or "N/A"), str(position.get("holdSide") or "long").lower())
             ),
         )
         for position in positions
     ]
-    first_chunk_limit = MAX_FIELDS_PER_EMBED - 2
+    first_chunk_limit = MAX_FIELDS_PER_EMBED
     first_chunk = fields[:first_chunk_limit]
     remaining_fields = fields[first_chunk_limit:]
     remaining_chunks = [
@@ -408,24 +405,6 @@ def build_public_position_embeds(
 
     for index, chunk in enumerate(chunks, start=1):
         embed_fields = list(chunk)
-        if index == 1:
-            embed_fields.insert(
-                0,
-                {
-                    "name": "Summary",
-                    "value": f"`JST` {observed_text}\n`Privacy` Personal realized/unrealized PnL amounts and total PnL are hidden.",
-                    "inline": False,
-                },
-            )
-            embed_fields.insert(
-                1,
-                {
-                    "name": "Legend",
-                    "value": "`BN` Binance | `BB` Bybit | `BG` Bitget | `GT` Gate | `HL` Hyperliquid",
-                    "inline": False,
-                },
-            )
-
         title_suffix = f" [{index}/{len(chunks)}]" if len(chunks) > 1 else ""
         embeds.append(
             {

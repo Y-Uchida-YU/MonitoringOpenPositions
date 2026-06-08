@@ -346,14 +346,19 @@ def test_public_discord_embed_hides_private_profit_amounts() -> None:
         risk_scores_by_position={("BTCUSDT", "long"): result},
     )
     text = "\n".join(field["value"] for field in embeds[0]["fields"])
-    assert "BTCUSDT (long)" == embeds[0]["fields"][2]["name"]
+    assert "Position Monitor Public -" in embeds[0]["title"]
+    assert "JST" in embeds[0]["title"]
+    assert "BTCUSDT (long)" == embeds[0]["fields"][0]["name"]
     assert "PnL%" in text
     assert "-40%" in text
     assert "Entry Price" in text
     assert "Mark Price" in text
     assert "Risk" in text
-    assert "`OI`" in text
-    assert "`Vol`" in text
-    assert "2.1" in text or "2.10" in text
+    assert "Reasons" not in text
+    assert "Market" not in text
+    assert "`OI`" not in text
+    assert "`Vol`" not in text
+    assert "2.1" not in text
+    assert "2.10" not in text
     assert "1234.56" not in text
     assert "Total Unrealized PnL" not in text
